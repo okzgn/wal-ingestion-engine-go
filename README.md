@@ -90,7 +90,7 @@ When receiving massive volumes of third-party webhooks:
 ```bash
 # 1. Clone the repository
 git clone https://github.com/okzgn/wal-ingestion-engine-go.git
-cd wal-ingestion-engine
+cd wal-ingestion-engine-go
 
 # 2. Download dependencies
 go mod tidy
