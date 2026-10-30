@@ -1,0 +1,47 @@
+# Binaries and build output
+/bin/
+/dist/
+*.exe
+*.test
+
+# Test, coverage and profiling output
+*.out
+*.cover
+coverage.html
+*.prof
+*.pprof
+
+# Runtime data: spool directories and the instance lock.
+# /data/ is the default DATA_DIR; the other entries appear when running with
+# DATA_DIR=. (the v1 layout) from the repository root.
+/data/
+/ingestions/
+/processing/
+/failed/
+/spool.lock
+
+# Logs
+*.log
+
+# Local config and secrets (the example file stays tracked)
+.env
+.env.*
+!.env.example
+
+# Go workspaces
+go.work
+go.work.sum
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/
+
+# Editors / OS
+.vscode/
+.idea/
+.vs/
+*.code-workspace
+*.swp
+*~
+.DS_Store
+Thumbs.db

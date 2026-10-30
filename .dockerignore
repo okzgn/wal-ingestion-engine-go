@@ -1,0 +1,10 @@
+.git
+.github
+.claude
+data/
+ingestions/
+processing/
+failed/
+*.exe
+*.test
+docs/

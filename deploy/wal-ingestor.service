@@ -1,0 +1,43 @@
+[Unit]
+Description=WAL Ingestion Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wal-ingestor
+
+# Settings live in environment variables (see README). Keep the secret here,
+# readable only by root: chmod 600 /etc/wal-ingestor/wal-ingestor.env
+EnvironmentFile=-/etc/wal-ingestor/wal-ingestor.env
+Environment=LISTEN_ADDR=:8080
+Environment=DATA_DIR=/var/lib/wal-ingestor
+
+User=wal-ingestor
+Group=wal-ingestor
+StateDirectory=wal-ingestor
+
+Restart=always
+RestartSec=2
+
+# SIGTERM triggers the graceful shutdown. TimeoutStopSec must be longer than
+# SHUTDOWN_TIMEOUT (default 15s) so systemd never SIGKILLs a clean shutdown.
+# A SIGKILL is still safe: unfinished files resume from their checkpoint.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Many concurrent connections need many file descriptors.
+LimitNOFILE=65535
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/wal-ingestor
+# Only needed to listen on a port below 1024 (for example LISTEN_ADDR=:80):
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
