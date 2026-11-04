@@ -28,22 +28,24 @@ import (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Getenv, os.Stderr))
+	os.Exit(run(os.Args[1:], os.LookupEnv, os.Stderr))
 }
 
-func run(args []string, getenv func(string) string, stderr io.Writer) int {
+// run is the program. lookup follows os.LookupEnv: a variable set to the empty
+// string is applied as empty, so "ADMIN_ADDR=" really disables the admin port.
+func run(args []string, lookup func(string) (string, bool), stderr io.Writer) int {
 	// "ingestor healthcheck" lets container runtimes probe a binary that has no
 	// shell or curl (distroless images).
 	if len(args) == 1 && args[0] == "healthcheck" {
-		return healthcheck(getenv, stderr)
+		return healthcheck(lookup, stderr)
 	}
-	cfg, err := config.Load(args, getenv)
+	cfg, err := config.Load(args, lookup)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			fmt.Fprintf(stderr, "Usage: ingestor [flags]\n\nEvery flag has an environment variable; flags win.\n\n%s", config.Usage())
+			_, _ = fmt.Fprintf(stderr, "Usage: ingestor [flags]\n\nEvery flag has an environment variable; flags win.\n\n%s", config.Usage())
 			return 0
 		}
-		fmt.Fprintf(stderr, "configuration error:\n%v\n\nRun with -h to list every setting.\n", err)
+		_, _ = fmt.Fprintf(stderr, "configuration error:\n%v\n\nRun with -h to list every setting.\n", err)
 		return 2
 	}
 	log := newLogger(cfg, stderr)
@@ -55,20 +57,24 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 }
 
 // healthcheck probes the local admin /healthz endpoint and returns an exit code.
-func healthcheck(getenv func(string) string, stderr io.Writer) int {
-	addr := getenv("ADMIN_ADDR")
-	if addr == "" {
+func healthcheck(lookup func(string) (string, bool), stderr io.Writer) int {
+	addr, set := lookup("ADMIN_ADDR")
+	if !set {
 		addr = "127.0.0.1:9090"
+	}
+	if addr == "" {
+		_, _ = fmt.Fprintln(stderr, "healthcheck: the admin listener is disabled (ADMIN_ADDR is empty)")
+		return 1
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(healthURL(addr))
 	if err != nil {
-		fmt.Fprintf(stderr, "healthcheck: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "healthcheck: %v\n", err)
 		return 1
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(stderr, "healthcheck: status %d\n", resp.StatusCode)
+		_, _ = fmt.Fprintf(stderr, "healthcheck: status %d\n", resp.StatusCode)
 		return 1
 	}
 	return 0
@@ -97,17 +103,32 @@ func newLogger(cfg *config.Config, w io.Writer) *slog.Logger {
 }
 
 func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
-	// 1. Data directory: exclusive lock, then recover what a previous run left.
+	// 1. Listeners first: a busy port is the most common start-up error and
+	//    must be reported before the data directory is locked and touched.
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
+	}
+	defer func() { _ = ln.Close() }()
+	var adminLn net.Listener
+	if cfg.AdminAddr != "" {
+		if adminLn, err = net.Listen("tcp", cfg.AdminAddr); err != nil {
+			return fmt.Errorf("admin listen on %s: %w", cfg.AdminAddr, err)
+		}
+		defer func() { _ = adminLn.Close() }()
+	}
+
+	// 2. Data directory: exclusive lock, then recover what a previous run left.
 	sp, err := spool.Open(cfg.DataDir, log)
 	if err != nil {
 		return err
 	}
-	defer sp.Close()
+	defer func() { _ = sp.Close() }()
 	if err := sp.Recover(); err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
 
-	// 2. The write-ahead log.
+	// 3. The write-ahead log.
 	w, err := wal.New(wal.Config{
 		Dir:              sp.Dirs.Ingestions,
 		MaxFileSize:      cfg.MaxFileSize,
@@ -124,10 +145,17 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("start wal: %w", err)
 	}
 
-	// 3. Workers.
+	// 4. Workers.
 	var dst sink.Sink = sink.Noop{}
 	if cfg.SinkURL != "" {
-		dst = sink.NewHTTP(cfg.SinkURL, cfg.SinkTimeout)
+		dst = sink.NewHTTP(sink.HTTPConfig{
+			URL:               cfg.SinkURL,
+			Timeout:           cfg.SinkTimeout,
+			MaxConns:          cfg.Workers,
+			Authorization:     cfg.SinkAuthorization,
+			Headers:           cfg.SinkHeaders,
+			PermanentStatuses: cfg.SinkPermanentStatuses,
+		})
 	} else {
 		log.Warn("SINK_URL is not set: messages are stored and then discarded")
 	}
@@ -136,7 +164,6 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		Proc: pipeline.NewProcessor(pipeline.Options{
 			Sink:               dst,
 			FailedDir:          sp.Dirs.Failed,
-			MaxMessageSize:     int(cfg.MaxMessageSize),
 			CheckpointInterval: cfg.CheckpointInterval,
 			Retry:              pipeline.RetryPolicy{MaxAttempts: cfg.SinkMaxAttempts, BaseDelay: cfg.SinkBackoffBase, MaxDelay: cfg.SinkBackoffMax},
 			Logger:             log,
@@ -152,7 +179,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 	go func() { runner.Run(runCtx); close(runnerDone) }()
 	defer stopRunner() // idempotent; covers the early error returns below
 
-	// 4. HTTP front door and admin endpoints.
+	// 5. HTTP front door and admin endpoints.
 	if cfg.WebhookSecret == "" {
 		log.Warn("WEBHOOK_SECRET is not set: requests are not authenticated")
 	}
@@ -166,6 +193,8 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		AckTimeout:         cfg.AckTimeout,
 		MaxBacklogBytes:    cfg.MaxBacklogBytes,
 		RateLimitPerMinute: cfg.RateLimitPerMinute,
+		TrustedProxies:     cfg.TrustedProxies,
+		ProxyHeader:        cfg.ProxyHeader,
 		Secret:             cfg.WebhookSecret,
 		SignatureHeader:    cfg.WebhookSignatureHeader,
 		TimestampHeader:    cfg.WebhookTimestampHeader,
@@ -173,10 +202,10 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 	}, w, sp.Disp, log)
 
 	var adm *admin.Admin
-	if cfg.AdminAddr != "" {
+	if adminLn != nil {
 		adm, err = admin.Start(admin.Options{
-			Addr:  cfg.AdminAddr,
-			Pprof: cfg.AdminPprof,
+			Listener: adminLn,
+			Pprof:    cfg.AdminPprof,
 			Ready: func() (bool, string) {
 				if !w.Healthy() {
 					return false, "write-ahead log is not accepting data"
@@ -200,8 +229,8 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 	sigCtx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Listen(cfg.ListenAddr) }()
-	log.Info("ready", "addr", cfg.ListenAddr, "endpoint", cfg.Endpoint, "data_dir", cfg.DataDir, "pid", os.Getpid())
+	go func() { serveErr <- srv.Serve(ln) }()
+	log.Info("ready", "addr", ln.Addr().String(), "endpoint", cfg.Endpoint, "data_dir", cfg.DataDir, "pid", os.Getpid())
 
 	var runErr error
 	select {
@@ -212,13 +241,17 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	stop() // a second Ctrl+C now terminates immediately
 
-	// 5. Shutdown, in the only order that loses nothing that was acknowledged:
+	// 6. Shutdown, in the only order that loses nothing that was acknowledged:
 	//    stop taking requests -> let in-flight ones finish and get their ACK ->
 	//    commit and close the WAL -> stop the workers (they checkpoint).
+	//    The whole sequence fits in SHUTDOWN_TIMEOUT: the HTTP drain gets the
+	//    budget minus a reserve for the WAL and the workers, which only need an
+	//    instant to commit what is queued and save their checkpoints.
 	deadline := time.Now().Add(cfg.ShutdownTimeout)
-	left := func() time.Duration { return max(time.Until(deadline), time.Second) }
+	left := func() time.Duration { return max(time.Until(deadline), 0) }
+	const reserve = 500 * time.Millisecond
 
-	if err := srv.Shutdown(left()); err != nil {
+	if err := srv.Shutdown(max(cfg.ShutdownTimeout-reserve, cfg.ShutdownTimeout/2)); err != nil {
 		log.Warn("http shutdown", "err", err)
 	}
 	walCtx, cancelWal := context.WithTimeout(context.Background(), left())
@@ -231,10 +264,14 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 	select {
 	case <-runnerDone:
 	case <-time.After(left()):
-		log.Warn("workers did not stop in time; their files resume from the last checkpoint")
+		select {
+		case <-runnerDone:
+		default:
+			log.Warn("workers did not stop in time; their files resume from the last checkpoint")
+		}
 	}
 	if adm != nil {
-		admCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		admCtx, cancel := context.WithTimeout(context.Background(), max(left(), 100*time.Millisecond))
 		_ = adm.Shutdown(admCtx)
 		cancel()
 	}

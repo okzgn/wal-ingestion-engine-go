@@ -49,7 +49,8 @@ type File interface {
 // Opener creates a new, empty append-only file.
 type Opener func(path string) (File, error)
 
-// Handoff receives each closed file that holds data.
+// Handoff receives each closed file that holds data. It is called from a
+// dedicated goroutine, one file at a time, in rotation order.
 type Handoff interface {
 	Ready(path string)
 }
@@ -113,8 +114,10 @@ func (c *Config) defaults() {
 	}
 }
 
+// openOS creates the file readable by the service user only: it holds whatever
+// the webhooks carried.
 func openOS(path string) (File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o644)
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
 }
 
 type job struct {
@@ -135,6 +138,12 @@ type Writer struct {
 	inflight atomic.Int64
 	closeMu  sync.Once
 
+	// handoff carries rotated files to their own goroutine, in order, so the
+	// rename and the directory fsyncs of a rotation never stall the next group
+	// commit. When it is full the writer waits: that is the backpressure.
+	handoff     chan string
+	handoffDone chan struct{}
+
 	// Owned by the run goroutine.
 	f         File
 	path      string
@@ -150,12 +159,14 @@ type Writer struct {
 func New(cfg Config) (*Writer, error) {
 	cfg.defaults()
 	w := &Writer{
-		cfg:     cfg,
-		log:     cfg.Logger,
-		jobs:    make(chan job, cfg.QueueSize),
-		quit:    make(chan struct{}),
-		stopped: make(chan struct{}),
-		batch:   make([]byte, 0, cfg.MaxBatchBytes+(64<<10)),
+		cfg:         cfg,
+		log:         cfg.Logger,
+		jobs:        make(chan job, cfg.QueueSize),
+		quit:        make(chan struct{}),
+		stopped:     make(chan struct{}),
+		handoff:     make(chan string, 64),
+		handoffDone: make(chan struct{}),
+		batch:       make([]byte, 0, cfg.MaxBatchBytes+(64<<10)),
 	}
 	w.rotTimer = time.NewTimer(time.Hour)
 	w.rotTimer.Stop()
@@ -164,6 +175,7 @@ func New(cfg Config) (*Writer, error) {
 	}
 	w.healthy.Store(true)
 	metrics.Degraded.Set(0)
+	go w.handoffLoop()
 	go w.run()
 	return w, nil
 }
@@ -224,12 +236,22 @@ func (w *Writer) Close(ctx context.Context) error {
 	case <-w.stopped:
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-w.stopped: // finished just in time
+			return nil
+		default:
+			return ctx.Err()
+		}
 	}
 }
 
 func (w *Writer) run() {
 	defer close(w.stopped)
+	// Deliver the last file before reporting stopped (defers run in reverse).
+	defer func() {
+		close(w.handoff)
+		<-w.handoffDone
+	}()
 	retry := w.cfg.RetryMin
 	retryTimer := time.NewTimer(time.Hour)
 	retryTimer.Stop()
@@ -277,6 +299,16 @@ func (w *Writer) run() {
 			w.drain()
 			w.finalize()
 			return
+		}
+	}
+}
+
+// handoffLoop hands rotated files over one at a time, in rotation order.
+func (w *Writer) handoffLoop() {
+	defer close(w.handoffDone)
+	for path := range w.handoff {
+		if w.cfg.Handoff != nil {
+			w.cfg.Handoff.Ready(path)
 		}
 	}
 }
@@ -392,8 +424,8 @@ func (w *Writer) rotate() {
 	}
 }
 
-// closeCurrent closes the active file and hands it to the workers (or removes it
-// if it is empty).
+// closeCurrent closes the active file and queues it for the workers (or removes
+// it if it is empty).
 func (w *Writer) closeCurrent() {
 	if w.f == nil {
 		return
@@ -408,9 +440,7 @@ func (w *Writer) closeCurrent() {
 		return
 	}
 	metrics.FilesRotated.Add(1)
-	if w.cfg.Handoff != nil {
-		w.cfg.Handoff.Ready(path)
-	}
+	w.handoff <- path
 }
 
 func (w *Writer) openFile() error {

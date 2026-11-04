@@ -207,7 +207,7 @@ func newEnv(t *testing.T, mutate func(*Options)) *env {
 	o := Options{
 		Sink:               e.sink,
 		FailedDir:          e.failed,
-		MaxMessageSize:     1024,
+		MaxLineSize:        1024,
 		CheckpointInterval: 2,
 		Retry:              RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond},
 		Logger:             quiet,
@@ -329,24 +329,6 @@ func TestProcessor_PermanentErrorGoesToDeadLetterAndContinues(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(bad), "2\t") || !strings.Contains(string(bad), `{"poison":true}`) {
 		t.Fatalf("dead letter = %q", bad)
-	}
-}
-
-// Regression C3: one oversized line used to abort the whole file (and, when the
-// rename failed, truncate it to zero bytes).
-func TestLineReader_OversizeLineQuarantined(t *testing.T) {
-	e := newEnv(t, nil) // MaxMessageSize = 1024
-	huge := `{"big":"` + strings.Repeat("x", 5000) + `"}`
-	p := e.writeFile(t, "e.list", "{\"i\":1}\n"+huge+"\n{\"i\":3}\n")
-	if err := e.proc.ProcessFile(context.Background(), p); err != nil {
-		t.Fatal(err)
-	}
-	if got := e.sink.got(); len(got) != 2 || got[1] != `{"i":3}` {
-		t.Fatalf("neighbours of the oversized line must be delivered, got %v", got)
-	}
-	bad, _ := os.ReadFile(filepath.Join(e.failed, "e.list.bad"))
-	if !strings.HasPrefix(string(bad), "2\t") || len(bad) > previewLimit+200 {
-		t.Fatalf("oversized line must be recorded truncated, got %d bytes", len(bad))
 	}
 }
 
@@ -540,5 +522,88 @@ func TestRunner_GivesUpAfterMaxFileAttempts(t *testing.T) {
 	}
 	if exists(path) {
 		t.Fatal("file must have moved out of processing/")
+	}
+}
+
+// Regression C3: one oversized line used to abort the whole file (and, when the
+// rename failed, truncate it to zero bytes). Its leading bytes are kept in the
+// dead letter instead of a 4 KiB preview.
+func TestLineReader_OversizeLineQuarantined(t *testing.T) {
+	e := newEnv(t, nil) // MaxLineSize = 1024
+	huge := `{"big":"` + strings.Repeat("x", 5000) + `"}`
+	p := e.writeFile(t, "e.list", "{\"i\":1}\n"+huge+"\n{\"i\":3}\n")
+	if err := e.proc.ProcessFile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.sink.got(); len(got) != 2 || got[1] != `{"i":3}` {
+		t.Fatalf("neighbours of the oversized line must be delivered, got %v", got)
+	}
+	bad, _ := os.ReadFile(filepath.Join(e.failed, "e.list.bad"))
+	rec := strings.SplitN(strings.TrimSuffix(string(bad), "\n"), "\t", 3)
+	if len(rec) != 3 || rec[0] != "2" || !strings.Contains(rec[1], "maximum line size") {
+		t.Fatalf("dead letter = %q", bad)
+	}
+	if rec[2] != huge[:1024] {
+		t.Fatalf("the first MaxLineSize bytes must be kept, got %d bytes", len(rec[2]))
+	}
+}
+
+// A line larger than the server's limit is still a message that was accepted:
+// lowering MAX_MESSAGE_SIZE must not truncate what is already on disk.
+func TestProcessor_LinesAboveMessageSizeAreStillDelivered(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.MaxLineSize = 0 }) // default: 16 MiB
+	long := `{"big":"` + strings.Repeat("x", 3000) + `"}`
+	p := e.writeFile(t, "l.list", long+"\n")
+	if err := e.proc.ProcessFile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.sink.got(); len(got) != 1 || got[0] != long {
+		t.Fatalf("delivered %d messages", len(got))
+	}
+}
+
+// A dead letter that could not be written used to be dropped: the warning was
+// logged, the file deleted and the rejected line gone for good.
+func TestProcessor_UnwritableDeadLetterKeepsFile(t *testing.T) {
+	e := newEnv(t, nil)
+	// A regular file where failed/ should be: no .bad can be created inside it.
+	blocked := filepath.Join(e.dir, "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.proc = NewProcessor(Options{Sink: e.sink, FailedDir: blocked, MaxLineSize: 1024, CheckpointInterval: 2, Logger: quiet})
+	p := e.writeFile(t, "k.list", "{\"i\":1}\nnot json\n{\"i\":3}\n")
+
+	err := e.proc.ProcessFile(context.Background(), p)
+	if !errors.Is(err, ErrRetryLater) {
+		t.Fatalf("want ErrRetryLater, got %v", err)
+	}
+	if !exists(p) {
+		t.Fatal("the file must be kept while its dead letter is not on disk")
+	}
+	ck, v, _ := OpenCheckpoint(p + spool.CheckpointExt)
+	ck.Close()
+	if v >= 2 {
+		t.Fatalf("checkpoint must stay before the rejected line, got %d", v)
+	}
+
+	// failed/ becomes writable: the line is dead-lettered and the file completes.
+	e.proc = NewProcessor(Options{Sink: e.sink, FailedDir: e.failed, MaxLineSize: 1024, CheckpointInterval: 2, Logger: quiet})
+	if err := e.proc.ProcessFile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	bad, err := os.ReadFile(filepath.Join(e.failed, "k.list.bad"))
+	if err != nil || !strings.HasPrefix(string(bad), "2\tinvalid JSON\tnot json\n") {
+		t.Fatalf("dead letter = %q (%v)", bad, err)
+	}
+	if exists(p) {
+		t.Fatal("completed file must be deleted")
+	}
+	seen := map[string]int{}
+	for _, l := range e.sink.got() {
+		seen[l]++
+	}
+	if seen[`{"i":1}`] == 0 || seen[`{"i":3}`] == 0 {
+		t.Fatalf("valid neighbours must be delivered, got %v", e.sink.got())
 	}
 }

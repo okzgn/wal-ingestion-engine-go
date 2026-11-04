@@ -39,10 +39,11 @@ func NewDirs(root string) Dirs {
 	}
 }
 
-// Create makes sure all directories exist.
+// Create makes sure all directories exist. They are private to the service
+// user: the files inside hold whatever the webhooks carried.
 func (d Dirs) Create() error {
 	for _, dir := range []string{d.Ingestions, d.Processing, d.Failed} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 	}

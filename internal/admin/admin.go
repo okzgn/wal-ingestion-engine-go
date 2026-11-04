@@ -5,10 +5,12 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"expvar"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,8 +20,11 @@ import (
 
 // Options configures the admin server.
 type Options struct {
-	Addr  string
-	Pprof bool
+	Addr string
+	// Listener, when set, is served instead of binding Addr. Binding it up
+	// front lets a busy port fail before the engine touches its data directory.
+	Listener net.Listener
+	Pprof    bool
 	// Ready reports whether the engine can take traffic, with a reason when not.
 	Ready  func() (ok bool, reason string)
 	Logger *slog.Logger
@@ -37,13 +42,19 @@ func Start(o Options) (*Admin, error) {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	ln, err := net.Listen("tcp", o.Addr)
-	if err != nil {
-		return nil, err
+	ln := o.Listener
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", o.Addr); err != nil {
+			return nil, err
+		}
 	}
 	a := &Admin{ln: ln, srv: &http.Server{
 		Handler:           Handler(o),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		// No WriteTimeout: /debug/pprof/profile streams for 30s by design.
 	}}
 	go func() {
 		if err := a.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -76,7 +87,7 @@ func Handler(o Options) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ready": true})
 	})
-	mux.Handle("GET /debug/vars", expvar.Handler())
+	mux.HandleFunc("GET /debug/vars", vars)
 	if o.Pprof {
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -85,6 +96,27 @@ func Handler(o Options) http.Handler {
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	}
 	return mux
+}
+
+// vars is expvar.Handler without "cmdline": the command line can carry a
+// SINK_URL or a data path that has no business on a metrics endpoint.
+func vars(w http.ResponseWriter, _ *http.Request) {
+	var b bytes.Buffer
+	b.WriteString("{\n")
+	first := true
+	expvar.Do(func(kv expvar.KeyValue) {
+		if kv.Key == "cmdline" {
+			return
+		}
+		if !first {
+			b.WriteString(",\n")
+		}
+		first = false
+		fmt.Fprintf(&b, "%q: %s", kv.Key, kv.Value)
+	})
+	b.WriteString("\n}\n")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write(b.Bytes())
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

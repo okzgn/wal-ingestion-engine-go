@@ -21,6 +21,12 @@ ENV LISTEN_ADDR=:8080 \
 VOLUME /data
 EXPOSE 8080
 
+# SIGTERM starts the graceful shutdown, which takes up to SHUTDOWN_TIMEOUT
+# (15s by default): give the container a longer stop grace period than that
+# (docker stop -t 30, stop_grace_period: 30s, terminationGracePeriodSeconds: 30).
+# A SIGKILL is still safe, only less tidy.
+STOPSIGNAL SIGTERM
+
 # distroless has no curl: the binary can probe itself.
 HEALTHCHECK --interval=15s --timeout=4s --start-period=5s --retries=3 \
   CMD ["/usr/local/bin/ingestor", "healthcheck"]

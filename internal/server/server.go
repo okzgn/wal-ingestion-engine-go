@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/limiter"
 
+	"github.com/okzgn/wal-ingestion-engine-go/internal/logutil"
 	"github.com/okzgn/wal-ingestion-engine-go/internal/metrics"
 	"github.com/okzgn/wal-ingestion-engine-go/internal/wal"
 )
@@ -43,6 +45,13 @@ type Config struct {
 	MaxBacklogBytes    int64
 	RateLimitPerMinute int
 
+	// TrustedProxies lists the reverse proxies (IPs or CIDRs) whose ProxyHeader
+	// is believed for the client IP that the rate limit keys on. Without it
+	// every request behind a proxy shares the proxy's IP and the per-client
+	// limit silently becomes a global one.
+	TrustedProxies []string
+	ProxyHeader    string // default X-Forwarded-For
+
 	// HMAC verification is enabled when Secret is not empty.
 	Secret          string
 	SignatureHeader string
@@ -59,6 +68,11 @@ type Server struct {
 	ver     *Verifier
 	log     *slog.Logger
 	pool    sync.Pool
+
+	// Both lines can repeat thousands of times per second while the disk is
+	// failing; they are throttled so the log keeps the signal, not the flood.
+	notPersisted *logutil.Throttle
+	failed       *logutil.Throttle
 }
 
 // New builds the server and its routes.
@@ -78,14 +92,21 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 	if cfg.SignatureHeader == "" {
 		cfg.SignatureHeader = "X-Signature-256"
 	}
+	if cfg.ProxyHeader == "" {
+		cfg.ProxyHeader = fiber.HeaderXForwardedFor
+	}
 
-	s := &Server{cfg: cfg, w: w, backlog: backlog, log: log}
+	s := &Server{
+		cfg: cfg, w: w, backlog: backlog, log: log,
+		notPersisted: logutil.NewThrottle(time.Second),
+		failed:       logutil.NewThrottle(time.Second),
+	}
 	s.pool.New = func() any { return new(bytes.Buffer) }
 	if cfg.Secret != "" {
 		s.ver = NewVerifier(cfg.Secret, cfg.TimestampHeader != "", cfg.Tolerance)
 	}
 
-	s.app = fiber.New(fiber.Config{
+	fcfg := fiber.Config{
 		AppName:      "WAL Ingestion Engine",
 		BodyLimit:    cfg.MaxMessageSize,
 		Concurrency:  cfg.MaxConnections,
@@ -93,7 +114,16 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 		WriteTimeout: cfg.WriteTimeout,
 		IdleTimeout:  cfg.IdleTimeout,
 		ErrorHandler: s.errorHandler,
-	})
+	}
+	if len(cfg.TrustedProxies) > 0 {
+		fcfg.TrustProxy = true
+		fcfg.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: cfg.TrustedProxies}
+		fcfg.ProxyHeader = cfg.ProxyHeader
+		// Walk a "client, proxy1, proxy2" chain from the right past the trusted
+		// hops instead of believing whatever the client put first.
+		fcfg.EnableIPValidation = true
+	}
+	s.app = fiber.New(fcfg)
 
 	handlers := []any{s.webhook}
 	if cfg.RateLimitPerMinute > 0 {
@@ -112,9 +142,10 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 // App exposes the Fiber app (used by tests with app.Test).
 func (s *Server) App() *fiber.App { return s.app }
 
-// Listen blocks serving on addr until Shutdown is called.
-func (s *Server) Listen(addr string) error {
-	return s.app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true})
+// Serve blocks serving on ln until Shutdown is called. Binding the listener
+// first lets a busy port fail before anything else is started.
+func (s *Server) Serve(ln net.Listener) error {
+	return s.app.Listener(ln, fiber.ListenConfig{DisableStartupMessage: true})
 }
 
 // Shutdown stops accepting connections and waits for in-flight requests, up to
@@ -141,20 +172,18 @@ func (s *Server) webhook(c fiber.Ctx) error {
 		}
 	}
 
-	if !json.Valid(body) {
-		return s.reject(c, fiber.StatusBadRequest, "invalid_json", "body is not valid JSON")
-	}
-
-	if s.backlog != nil && s.cfg.MaxBacklogBytes > 0 && s.backlog.BacklogBytes() > s.cfg.MaxBacklogBytes {
-		return s.unavailable(c, "backlog_full", "the processing backlog is full")
-	}
-
-	// One message = one line: compact away every insignificant newline.
+	// One message = one line: compact away every insignificant newline. Compact
+	// validates as it goes, so this is the only JSON pass over the body.
 	buf := s.pool.Get().(*bytes.Buffer)
 	buf.Reset()
 	if err := json.Compact(buf, body); err != nil {
 		s.release(buf)
 		return s.reject(c, fiber.StatusBadRequest, "invalid_json", "body is not valid JSON")
+	}
+
+	if s.backlog != nil && s.cfg.MaxBacklogBytes > 0 && s.backlog.BacklogBytes() > s.cfg.MaxBacklogBytes {
+		s.release(buf)
+		return s.unavailable(c, "backlog_full", "the processing backlog is full")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.AckTimeout)
@@ -182,7 +211,9 @@ func (s *Server) webhook(c fiber.Ctx) error {
 		return s.reject(c, fiber.StatusBadRequest, "invalid_json", "message cannot be framed")
 	default:
 		s.release(buf)
-		s.log.Warn("message not persisted", "err", err)
+		if ok, suppressed := s.notPersisted.Allow(); ok {
+			s.log.Warn("message not persisted", "err", err, "suppressed", suppressed)
+		}
 		return s.unavailable(c, "unavailable", "storage is unavailable")
 	}
 }
@@ -222,7 +253,9 @@ func (s *Server) errorHandler(c fiber.Ctx, err error) error {
 	case fiber.StatusNotFound:
 		reason = "not_found"
 	default:
-		s.log.Warn("request failed", "code", code, "err", err)
+		if ok, suppressed := s.failed.Allow(); ok {
+			s.log.Warn("request failed", "code", code, "err", err, "suppressed", suppressed)
+		}
 	}
 	metrics.Reject(reason)
 	return c.Status(code).JSON(fiber.Map{"error": fiber.NewError(code).Message, "reason": reason})

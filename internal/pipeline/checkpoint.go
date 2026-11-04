@@ -26,7 +26,7 @@ type Checkpoint struct {
 
 // OpenCheckpoint opens (creating if needed) the checkpoint and returns its value.
 func OpenCheckpoint(path string) (*Checkpoint, uint64, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, 0, fmt.Errorf("open checkpoint: %w", err)
 	}

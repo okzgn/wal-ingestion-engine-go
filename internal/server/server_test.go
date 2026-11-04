@@ -353,3 +353,50 @@ func TestHandler_ManyConcurrentAreAllStored(t *testing.T) {
 		t.Fatalf("stored %d of 50", len(w.got()))
 	}
 }
+
+// Behind a reverse proxy every request used to share the proxy's IP, so the
+// per-client rate limit silently became a global one.
+func TestHandler_RateLimitKeysOnClientBehindTrustedProxy(t *testing.T) {
+	// app.Test connections arrive from 0.0.0.0: trust it as the proxy.
+	s := newServer(t, &fakeAppender{}, func(c *Config) {
+		c.RateLimitPerMinute = 2
+		c.TrustedProxies = []string{"0.0.0.0/32"}
+	})
+	codes := func(forwardedFor string, n int) (out []int) {
+		for i := 0; i < n; i++ {
+			code, _, _ := post(t, s, `{"a":1}`, map[string]string{"X-Forwarded-For": forwardedFor})
+			out = append(out, code)
+		}
+		return out
+	}
+	if got := codes("203.0.113.1", 3); fmt.Sprint(got) != "[200 200 429]" {
+		t.Fatalf("client A: %v", got)
+	}
+	// A chain: the trusted hop on the right is skipped, the client is found.
+	if got := codes("203.0.113.2, 0.0.0.0", 2); fmt.Sprint(got) != "[200 200]" {
+		t.Fatalf("client B must have its own budget, got %v", got)
+	}
+}
+
+func TestHandler_ForwardedForIsIgnoredWithoutTrustedProxies(t *testing.T) {
+	s := newServer(t, &fakeAppender{}, func(c *Config) { c.RateLimitPerMinute = 2 })
+	var codes []int
+	for i := 0; i < 3; i++ {
+		code, _, _ := post(t, s, `{"a":1}`, map[string]string{"X-Forwarded-For": fmt.Sprintf("203.0.113.%d", i)})
+		codes = append(codes, code)
+	}
+	if fmt.Sprint(codes) != "[200 200 429]" {
+		t.Fatalf("a spoofed header must not buy a fresh budget: %v", codes)
+	}
+}
+
+// Sender errors are reported as such even while the engine sheds load.
+func TestHandler_InvalidJSONIsRefusedEvenWithFullBacklog(t *testing.T) {
+	s := New(Config{MaxMessageSize: 1 << 20, MaxBacklogBytes: 100}, &fakeAppender{}, fakeBacklog(101), quiet)
+	if code, _, _ := post(t, s, `not json`, nil); code != 400 {
+		t.Fatalf("status %d, want 400", code)
+	}
+	if code, _, _ := post(t, s, ` `, nil); code != 400 {
+		t.Fatalf("whitespace-only body: status %d, want 400", code)
+	}
+}

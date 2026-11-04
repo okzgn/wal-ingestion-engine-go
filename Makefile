@@ -1,4 +1,4 @@
-.PHONY: build test test-short race e2e lint vet fmt bench loadgen docker clean
+.PHONY: build test test-short race e2e lint vet fmt fmt-check vuln check bench loadgen docker clean
 
 BIN := bin/ingestor
 
@@ -21,11 +21,21 @@ e2e:
 fmt:
 	gofmt -w .
 
+fmt-check:
+	@test -z "$$(gofmt -l .)" || { echo "files need gofmt:"; gofmt -l .; exit 1; }
+
 vet:
 	go vet ./...
 
 lint:
 	golangci-lint run
+
+# Known vulnerabilities in the toolchain and the dependencies actually called.
+vuln:
+	govulncheck ./...
+
+# Everything CI runs.
+check: fmt-check vet lint vuln test
 
 bench:
 	go test -run XXX -bench . -benchmem ./internal/wal/

@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +19,11 @@ import (
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/config"
 )
+
+// lookup mimics os.LookupEnv over a map.
+func lookup(m map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+}
 
 func TestHealthURL(t *testing.T) {
 	for in, want := range map[string]string{
@@ -36,48 +43,62 @@ func TestHealthcheckExitCodes(t *testing.T) {
 	status := http.StatusOK
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
 	defer srv.Close()
-	addr := strings.TrimPrefix(srv.URL, "http://")
-	getenv := func(k string) string {
-		if k == "ADMIN_ADDR" {
-			return addr
-		}
-		return ""
-	}
+	env := lookup(map[string]string{"ADMIN_ADDR": strings.TrimPrefix(srv.URL, "http://")})
 
 	var buf bytes.Buffer
-	if code := run([]string{"healthcheck"}, getenv, &buf); code != 0 {
+	if code := run([]string{"healthcheck"}, env, &buf); code != 0 {
 		t.Fatalf("healthy: exit %d (%s)", code, buf.String())
 	}
 	status = http.StatusServiceUnavailable
-	if code := run([]string{"healthcheck"}, getenv, &buf); code != 1 {
+	if code := run([]string{"healthcheck"}, env, &buf); code != 1 {
 		t.Fatalf("unhealthy: exit %d", code)
 	}
 	srv.Close()
-	if code := run([]string{"healthcheck"}, getenv, &buf); code != 1 {
+	if code := run([]string{"healthcheck"}, env, &buf); code != 1 {
 		t.Fatalf("unreachable: exit %d", code)
+	}
+	buf.Reset()
+	if code := run([]string{"healthcheck"}, lookup(map[string]string{"ADMIN_ADDR": ""}), &buf); code != 1 || !strings.Contains(buf.String(), "disabled") {
+		t.Fatalf("disabled admin: exit %d, output %q", code, buf.String())
 	}
 }
 
 func TestRun_ConfigErrorExitsWithTwo(t *testing.T) {
 	var buf bytes.Buffer
-	getenv := func(k string) string {
-		if k == "WORKERS" {
-			return "0"
-		}
-		return ""
-	}
-	if code := run(nil, getenv, &buf); code != 2 || !strings.Contains(buf.String(), "WORKERS") {
+	if code := run(nil, lookup(map[string]string{"WORKERS": "0"}), &buf); code != 2 || !strings.Contains(buf.String(), "WORKERS") {
 		t.Fatalf("exit %d, output %q", code, buf.String())
 	}
 }
 
 func TestRun_HelpListsSettings(t *testing.T) {
 	var buf bytes.Buffer
-	if code := run([]string{"-h"}, func(string) string { return "" }, &buf); code != 0 {
+	if code := run([]string{"-h"}, lookup(nil), &buf); code != 0 {
 		t.Fatalf("exit %d", code)
 	}
 	if !strings.Contains(buf.String(), "WEBHOOK_SECRET") || !strings.Contains(buf.String(), "DATA_DIR") {
 		t.Fatalf("help output incomplete: %s", buf.String())
+	}
+}
+
+// A busy port is reported before the data directory is locked, so a failed
+// start never leaves a lock or moves files around.
+func TestServe_BusyPortFailsBeforeTouchingData(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	dir := t.TempDir()
+	cfg, err := config.Load(nil, lookup(map[string]string{"LISTEN_ADDR": l.Addr().String(), "ADMIN_ADDR": "", "DATA_DIR": dir}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = serve(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("want a listen error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "spool.lock")); !os.IsNotExist(err) {
+		t.Fatal("the data directory must not be touched when the port is busy")
 	}
 }
 
@@ -101,11 +122,10 @@ func TestServe_GracefulShutdownLosesNothing(t *testing.T) {
 
 	dir := t.TempDir()
 	addr, admin := freeAddr(t), freeAddr(t)
-	env := map[string]string{
+	cfg, err := config.Load(nil, lookup(map[string]string{
 		"LISTEN_ADDR": addr, "ADMIN_ADDR": admin, "DATA_DIR": dir, "SINK_URL": down.URL,
 		"ROTATION_INTERVAL": "100ms", "SHUTDOWN_TIMEOUT": "10s", "LOG_LEVEL": "error",
-	}
-	cfg, err := config.Load(nil, func(k string) string { return env[k] })
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}

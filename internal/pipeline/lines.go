@@ -8,8 +8,9 @@ import (
 
 // lineReader reads newline-terminated records of any length without ever
 // failing on a long one (unlike bufio.Scanner, which aborts the whole file with
-// ErrTooLong). A line longer than max is reported as tooLong and skipped, so a
-// single bad record can never take its neighbours down with it.
+// ErrTooLong). A line longer than max is reported as tooLong with its first max
+// bytes kept, so a single bad record can never take its neighbours down with it
+// and its leading part still reaches the dead-letter file.
 type lineReader struct {
 	br  *bufio.Reader
 	max int
@@ -21,9 +22,9 @@ func newLineReader(r io.Reader, max int) *lineReader {
 }
 
 // next returns the next line without its terminator. The slice is only valid
-// until the following call. For a tooLong line it holds the leading part that
-// was kept. terminated is false for a final line with no '\n', which is the
-// signature of a torn write. It returns io.EOF when there are no more lines.
+// until the following call. For a tooLong line it holds the first max bytes.
+// terminated is false for a final line with no '\n', which is the signature of
+// a torn write. It returns io.EOF when there are no more lines.
 func (lr *lineReader) next() (line []byte, tooLong, terminated bool, err error) {
 	lr.buf = lr.buf[:0]
 	started := false
@@ -37,11 +38,11 @@ func (lr *lineReader) next() (line []byte, tooLong, terminated bool, err error) 
 				data = chunk[:len(chunk)-1]
 			}
 			if !tooLong {
-				if len(lr.buf)+len(data) > lr.max {
+				if room := lr.max - len(lr.buf); len(data) > room {
 					tooLong = true
-				} else {
-					lr.buf = append(lr.buf, data...)
+					data = data[:room]
 				}
+				lr.buf = append(lr.buf, data...)
 			}
 			if term {
 				return lr.buf, tooLong, true, nil

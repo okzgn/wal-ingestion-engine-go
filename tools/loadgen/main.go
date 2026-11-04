@@ -83,7 +83,7 @@ func main() {
 					continue
 				}
 				_, _ = io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				mu.Lock()
 				latencies = append(latencies, d)
 				codes[resp.StatusCode]++
@@ -110,7 +110,7 @@ func main() {
 	fmt.Printf("status codes: %v\n", codes)
 
 	if *idsFile != "" {
-		if err := os.WriteFile(*idsFile, []byte(strings.Join(acked, "\n")+"\n"), 0o644); err != nil {
+		if err := os.WriteFile(*idsFile, []byte(strings.Join(acked, "\n")+"\n"), 0o600); err != nil {
 			fmt.Fprintln(os.Stderr, "write ids:", err)
 			os.Exit(1)
 		}

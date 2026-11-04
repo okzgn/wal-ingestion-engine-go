@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -79,5 +81,43 @@ func TestStart_BindsAndServes(t *testing.T) {
 	}
 	if _, err := Start(Options{Addr: a.Addr()}); err == nil {
 		t.Fatal("a busy port must be reported at start")
+	}
+}
+
+// The command line can carry SINK_URL or paths; metrics are no place for it.
+func TestMetricsDoNotExposeCommandLine(t *testing.T) {
+	_, body := get(Handler(Options{}), "/debug/vars")
+	if strings.Contains(body, `"cmdline"`) {
+		t.Fatal("/debug/vars must not expose the command line")
+	}
+	var v map[string]any
+	if err := json.Unmarshal([]byte(body), &v); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, body)
+	}
+	if _, ok := v["memstats"]; !ok {
+		t.Fatal("the other expvar values must still be served")
+	}
+}
+
+func TestStart_ServesProvidedListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := Start(Options{Listener: ln})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Shutdown(t.Context())
+	if a.Addr() != ln.Addr().String() {
+		t.Fatalf("addr %s, want %s", a.Addr(), ln.Addr())
+	}
+	resp, err := http.Get("http://" + a.Addr() + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
 }

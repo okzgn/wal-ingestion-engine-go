@@ -1,6 +1,8 @@
 // Package config loads and validates the engine settings. Every setting has an
 // environment variable and, except secrets, an equivalent command-line flag
-// (lower-case, dashes). Precedence: flag > environment > default.
+// (lower-case, dashes). Precedence: flag > environment > default. An environment
+// variable that is set to the empty string counts as set, so "ADMIN_ADDR="
+// disables the admin listener instead of silently restoring the default.
 package config
 
 import (
@@ -8,6 +10,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -30,22 +34,27 @@ type Config struct {
 	MaxInflightBytes int64
 	MaxBacklogBytes  int64
 
-	Workers            int
-	CheckpointInterval int
-	SinkURL            string
-	SinkTimeout        time.Duration
-	SinkMaxAttempts    int
-	SinkBackoffBase    time.Duration
-	SinkBackoffMax     time.Duration
-	FileRetryBase      time.Duration
-	FileRetryMax       time.Duration
-	MaxFileAttempts    int
+	Workers               int
+	CheckpointInterval    int
+	SinkURL               string
+	SinkTimeout           time.Duration
+	SinkMaxAttempts       int
+	SinkBackoffBase       time.Duration
+	SinkBackoffMax        time.Duration
+	SinkAuthorization     string
+	SinkHeaders           http.Header
+	SinkPermanentStatuses []int
+	FileRetryBase         time.Duration
+	FileRetryMax          time.Duration
+	MaxFileAttempts       int
 
 	WebhookSecret          string
 	WebhookSignatureHeader string
 	WebhookTimestampHeader string
 	WebhookTolerance       time.Duration
 	RateLimitPerMinute     int
+	TrustedProxies         []string
+	ProxyHeader            string
 
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
@@ -88,6 +97,9 @@ func settings(c *Config) []setting {
 		{"SINK_MAX_ATTEMPTS", "sink-max-attempts", "5", "attempts per message before the file is postponed", num(&c.SinkMaxAttempts)},
 		{"SINK_BACKOFF_BASE", "sink-backoff-base", "200ms", "first per-message retry delay", dur(&c.SinkBackoffBase)},
 		{"SINK_BACKOFF_MAX", "sink-backoff-max", "30s", "per-message retry delay cap", dur(&c.SinkBackoffMax)},
+		{"SINK_AUTHORIZATION", "", "", "Authorization header sent with every delivery, e.g. 'Bearer <token>'", str(&c.SinkAuthorization)},
+		{"SINK_HEADERS", "", "", "extra delivery headers: 'Name: value, Name2: value2'", headers(&c.SinkHeaders)},
+		{"SINK_PERMANENT_STATUSES", "sink-permanent-statuses", "400,413,415,422", "destination statuses that dead-letter a message instead of retrying it", ints(&c.SinkPermanentStatuses)},
 		{"FILE_RETRY_BASE", "file-retry-base", "1s", "first delay before a postponed file is retried", dur(&c.FileRetryBase)},
 		{"FILE_RETRY_MAX", "file-retry-max", "1m", "postponed file retry delay cap", dur(&c.FileRetryMax)},
 		{"MAX_FILE_ATTEMPTS", "max-file-attempts", "0", "move a file to failed/ after this many postponements (0 = never)", num(&c.MaxFileAttempts)},
@@ -96,7 +108,9 @@ func settings(c *Config) []setting {
 		{"WEBHOOK_SIGNATURE_HEADER", "webhook-signature-header", "X-Signature-256", "header carrying sha256=<hex>", str(&c.WebhookSignatureHeader)},
 		{"WEBHOOK_TIMESTAMP_HEADER", "webhook-timestamp-header", "", "header carrying unix seconds; enables the anti-replay check", str(&c.WebhookTimestampHeader)},
 		{"WEBHOOK_TOLERANCE", "webhook-tolerance", "5m", "accepted clock skew for the timestamp", dur(&c.WebhookTolerance)},
-		{"RATE_LIMIT_PER_MINUTE", "rate-limit-per-minute", "0", "per-IP request limit (0 = off)", num(&c.RateLimitPerMinute)},
+		{"RATE_LIMIT_PER_MINUTE", "rate-limit-per-minute", "0", "per-client request limit (0 = off)", num(&c.RateLimitPerMinute)},
+		{"TRUSTED_PROXIES", "trusted-proxies", "", "IPs or CIDRs of reverse proxies whose PROXY_HEADER gives the client IP (empty = the TCP peer is the client)", list(&c.TrustedProxies)},
+		{"PROXY_HEADER", "proxy-header", "X-Forwarded-For", "header set by TRUSTED_PROXIES with the client IP", str(&c.ProxyHeader)},
 
 		{"READ_TIMEOUT", "read-timeout", "10s", "HTTP read timeout", dur(&c.ReadTimeout)},
 		{"WRITE_TIMEOUT", "write-timeout", "15s", "HTTP write timeout (must exceed ACK_TIMEOUT)", dur(&c.WriteTimeout)},
@@ -113,8 +127,9 @@ func settings(c *Config) []setting {
 }
 
 // Load builds the configuration from args (without the program name) and the
-// environment (getenv).
-func Load(args []string, getenv func(string) string) (*Config, error) {
+// environment. lookup follows os.LookupEnv: a variable that is present but
+// empty is applied as empty, it does not fall back to the default.
+func Load(args []string, lookup func(string) (string, bool)) (*Config, error) {
 	c := &Config{}
 	fs := flag.NewFlagSet("ingestor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -122,7 +137,7 @@ func Load(args []string, getenv func(string) string) (*Config, error) {
 	table := settings(c)
 	for _, s := range table {
 		v := s.def
-		if e := getenv(s.env); e != "" {
+		if e, ok := lookup(s.env); ok {
 			v = e
 		}
 		if err := s.set(v); err != nil {
@@ -219,8 +234,11 @@ func (c *Config) Validate() error {
 	}
 	if c.SinkURL != "" {
 		u, err := url.Parse(c.SinkURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		switch {
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
 			bad("SINK_URL must be an http(s) URL, got %q", c.SinkURL)
+		case u.User != nil:
+			bad("SINK_URL must not carry credentials (they would show up in logs); use SINK_AUTHORIZATION")
 		}
 	}
 	if c.SinkTimeout <= 0 {
@@ -231,6 +249,11 @@ func (c *Config) Validate() error {
 	}
 	if c.SinkBackoffBase <= 0 || c.SinkBackoffMax < c.SinkBackoffBase {
 		bad("SINK_BACKOFF_BASE must be positive and not above SINK_BACKOFF_MAX")
+	}
+	for _, s := range c.SinkPermanentStatuses {
+		if s < 400 || s > 599 {
+			bad("SINK_PERMANENT_STATUSES: %d is not a 4xx or 5xx status", s)
+		}
 	}
 	if c.FileRetryBase <= 0 || c.FileRetryMax < c.FileRetryBase {
 		bad("FILE_RETRY_BASE must be positive and not above FILE_RETRY_MAX")
@@ -249,6 +272,18 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimitPerMinute < 0 {
 		bad("RATE_LIMIT_PER_MINUTE must not be negative")
+	}
+	for _, p := range c.TrustedProxies {
+		if _, err := netip.ParseAddr(p); err == nil {
+			continue
+		}
+		if _, err := netip.ParsePrefix(p); err == nil {
+			continue
+		}
+		bad("TRUSTED_PROXIES: %q is neither an IP address nor a CIDR range", p)
+	}
+	if len(c.TrustedProxies) > 0 && c.ProxyHeader == "" {
+		bad("PROXY_HEADER must not be empty when TRUSTED_PROXIES is set")
 	}
 	if c.AckTimeout <= 0 {
 		bad("ACK_TIMEOUT must be positive")
@@ -324,6 +359,90 @@ func size(p *int64) func(string) error {
 		*p = n
 		return nil
 	}
+}
+
+// list splits a comma-separated value, trimming spaces and dropping empties.
+func list(p *[]string) func(string) error {
+	return func(v string) error {
+		*p = splitList(v)
+		return nil
+	}
+}
+
+// ints parses a comma-separated list of integers.
+func ints(p *[]int) func(string) error {
+	return func(v string) error {
+		var out []int
+		for _, item := range splitList(v) {
+			n, err := strconv.Atoi(item)
+			if err != nil {
+				return fmt.Errorf("not an integer list: %q", v)
+			}
+			out = append(out, n)
+		}
+		*p = out
+		return nil
+	}
+}
+
+func headers(p *http.Header) func(string) error {
+	return func(v string) error {
+		h, err := ParseHeaders(v)
+		if err != nil {
+			return err
+		}
+		*p = h
+		return nil
+	}
+}
+
+func splitList(v string) []string {
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// ParseHeaders parses "Name: value, Name2: value2". Headers are separated by
+// commas or newlines, so a value cannot contain a comma. Idempotency-Key is
+// reserved: the engine sets it on every delivery.
+func ParseHeaders(s string) (http.Header, error) {
+	h := http.Header{}
+	for _, item := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' }) {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(item, ":")
+		name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+		if !ok || !validHeaderName(name) {
+			return nil, fmt.Errorf("header %q is not of the form \"Name: value\"", item)
+		}
+		if strings.EqualFold(name, "Idempotency-Key") {
+			return nil, errors.New("header Idempotency-Key is set by the engine and cannot be overridden")
+		}
+		h.Add(name, value)
+	}
+	return h, nil
+}
+
+// validHeaderName reports whether s is an RFC 9110 token.
+func validHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ParseSize understands plain bytes ("1048576") and KB/MB/GB (decimal) or

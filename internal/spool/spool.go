@@ -68,7 +68,7 @@ func (s *Spool) Ready(path string) {
 		s.log.Error("cannot move file to processing; it will be retried on restart", "file", name, "err", err)
 		return
 	}
-	s.syncDirs()
+	s.syncDirs(s.Dirs.Ingestions, s.Dirs.Processing)
 	if s.Disp.Add(dst, info.Size()) {
 		s.log.Info("file ready to process", "file", name, "bytes", info.Size())
 	}
@@ -84,13 +84,14 @@ func (s *Spool) Quarantine(path string) error {
 	if _, err := os.Stat(ckpt); err == nil {
 		_ = fsutil.RenameWithRetry(ckpt, filepath.Join(s.Dirs.Failed, name+CheckpointExt), 5)
 	}
-	s.syncDirs()
+	s.syncDirs(s.Dirs.Processing, s.Dirs.Failed)
 	s.Disp.Done(path)
 	return nil
 }
 
-func (s *Spool) syncDirs() {
-	for _, dir := range []string{s.Dirs.Ingestions, s.Dirs.Processing, s.Dirs.Failed} {
+// syncDirs makes the entry changes of the given directories durable.
+func (s *Spool) syncDirs(dirs ...string) {
+	for _, dir := range dirs {
 		if err := fsutil.SyncDir(dir); err != nil {
 			s.log.Warn("directory fsync failed", "dir", dir, "err", err)
 		}
@@ -111,7 +112,7 @@ func (s *Spool) Recover() error {
 	if err := s.adoptIngestions(); err != nil {
 		return err
 	}
-	s.syncDirs()
+	s.syncDirs(s.Dirs.Ingestions, s.Dirs.Processing, s.Dirs.Failed)
 	return s.enqueueProcessing()
 }
 

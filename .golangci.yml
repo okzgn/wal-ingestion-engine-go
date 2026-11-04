@@ -13,10 +13,7 @@ linters:
     gosec:
       excludes:
         - G104 # unhandled errors are covered by errcheck
-        - G301 # directory permissions are deliberate (0755)
-        - G302 # file permissions are deliberate (0644)
         - G304 # paths come from our own spool directories
-        - G306
   exclusions:
     rules:
       - path: _test\.go

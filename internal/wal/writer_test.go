@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,6 +113,19 @@ func (r *recorder) count() int {
 	return len(r.paths)
 }
 
+// waitCount waits for n handoffs: they happen on their own goroutine, shortly
+// after the rotation.
+func waitCount(t *testing.T, rec *recorder, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for rec.count() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d handoffs, got %d", n, rec.count())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func newTestWriter(t *testing.T, fs *fakeFS, mutate func(*Config)) (*Writer, *recorder) {
 	t.Helper()
 	rec := &recorder{}
@@ -210,9 +224,7 @@ func TestWriter_OpenFailureDegradesAndRecovers(t *testing.T) {
 	if err := w.Append(context.Background(), []byte(`{"a":"0123456789"}`)); err != nil {
 		t.Fatalf("first append must succeed (it was committed): %v", err)
 	}
-	if rec.count() != 1 {
-		t.Fatalf("rotated file must be handed over, got %d", rec.count())
-	}
+	waitCount(t, rec, 1) // the rotated file must be handed over
 
 	// The ack is sent before the rotation runs, so wait for the degraded state.
 	deadline := time.Now().Add(2 * time.Second)
@@ -264,9 +276,7 @@ func TestWriter_RecoversAfterCommitFailure(t *testing.T) {
 	if err := w.Append(context.Background(), []byte(`{"after":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if rec.count() < 1 {
-		t.Fatal("the file holding the synced message must be handed over")
-	}
+	waitCount(t, rec, 1) // the file holding the synced message must be handed over
 	if len(fs.all()) != 2 {
 		t.Fatalf("expected a fresh file after recovery, have %d", len(fs.all()))
 	}
@@ -302,9 +312,7 @@ func TestWriter_RotatesBySize(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if rec.count() < 2 {
-		t.Fatalf("expected several rotations, got %d", rec.count())
-	}
+	waitCount(t, rec, 2) // several rotations
 }
 
 func TestWriter_RotatesByTimeOnlyWhenNotEmpty(t *testing.T) {
@@ -375,6 +383,30 @@ func TestWriter_CloseDrainsAndHandsOver(t *testing.T) {
 	}
 	if got := strings.Count(fs.all()[0].contents(), "\n"); int64(got) != acked.Load() {
 		t.Fatalf("acked %d messages but %d are on disk", acked.Load(), got)
+	}
+}
+
+// The handoff (rename + directory fsyncs) runs off the writer goroutine so it
+// never delays the next group commit, yet keeps rotation order and completes
+// before Close returns.
+func TestWriter_HandoffKeepsOrderAndFinishesBeforeClose(t *testing.T) {
+	fs := &fakeFS{}
+	w, rec := newTestWriter(t, fs, func(c *Config) { c.MaxFileSize = 16 })
+	const n = 40
+	for i := 0; i < n; i++ {
+		if err := w.Append(context.Background(), []byte(`{"k":"0123456789012345678901"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Every append fills a file past MaxFileSize: n rotations, all handed over once Close returns.
+	if rec.count() != n {
+		t.Fatalf("handoffs=%d, want %d", rec.count(), n)
+	}
+	if !sort.StringsAreSorted(rec.paths) {
+		t.Fatalf("files must be handed over in creation order: %v", rec.paths)
 	}
 }
 

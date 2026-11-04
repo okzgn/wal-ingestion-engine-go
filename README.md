@@ -31,7 +31,7 @@ When you receive large volumes of third-party webhooks:
 | **Delivery** | **At-least-once.** After a crash up to `CHECKPOINT_INTERVAL - 1` lines per in-flight file can be delivered again, and retries can repeat a message. |
 | **Deduplication** | Every delivery carries a deterministic `Idempotency-Key: <file>:<line>`, identical on every attempt. Your backend should deduplicate on it. |
 | **Ordering** | **None across files** with `WORKERS > 1`. With `WORKERS=1` files are delivered in arrival order while the backend is healthy; a postponed file is retried later, behind newer ones. |
-| **No silent loss** | Invalid, oversized or torn lines are never dropped silently: they go to `failed/<file>.bad`. A file that still holds undelivered messages is never deleted. |
+| **No silent loss** | Invalid, oversized or torn lines are never dropped silently: they go to `failed/<file>.bad`, and a file is deleted only once its dead letters are fsynced; if `failed/` cannot be written the file is kept and retried. A file that still holds undelivered messages is never deleted. After a crash or a postponed file, dead letters since the last checkpoint can appear twice: deduplicate on the line number. |
 | **Not provided** | Replication (the disk is the single point of failure), TLS (put a reverse proxy in front), exactly-once delivery. Durability is as good as your disk's `fsync`; check that the write cache is not lying. |
 
 ---
@@ -80,6 +80,8 @@ When you receive large volumes of third-party webhooks:
 | `failed/<file>.list` | Files given up on after `MAX_FILE_ATTEMPTS` postponements (off by default). |
 | `spool.lock` | Instance lock: a second process on the same `DATA_DIR` refuses to start. |
 
+Directories are created `0700` and files `0600`: they hold whatever the webhooks carried.
+
 On start the engine recovers sequentially, before accepting traffic: sweeps orphan checkpoints, moves any
 leftover `ingestions/*.list` into `processing/`, and queues everything in chronological order.
 
@@ -97,7 +99,7 @@ leftover `ingestions/*.list` into `processing/`, and queues everything in chrono
 | `405` / `404` | Wrong method / path. | Fix the request. |
 | `413` | Body larger than `MAX_MESSAGE_SIZE`. | Send less. |
 | `415` | `Content-Encoding` present (compression is refused: it would bypass the size limit and break signatures). | Send it uncompressed. |
-| `429` | Per-IP rate limit exceeded. | Back off. |
+| `429` | Per-client rate limit exceeded (behind a reverse proxy set `TRUSTED_PROXIES`, or the client is the proxy). | Back off. |
 | `503` + `Retry-After` | **Not stored**: disk failing, queue/in-flight/backlog limit hit, ack timeout, or shutting down. | Retry later. |
 
 Pretty-printed JSON is accepted: each message is compacted to a single line before it is stored.
@@ -106,7 +108,8 @@ Pretty-printed JSON is accepted: each message is compacted to a single line befo
 
 ## Getting started
 
-Requires **Go 1.26+**.
+Requires **Go 1.26.10+** (`go.mod` pins the minimum: earlier 1.26 patch releases carry known
+standard-library vulnerabilities; `GOTOOLCHAIN=auto` fetches it).
 
 ```bash
 git clone https://github.com/okzgn/wal-ingestion-engine-go.git
@@ -144,8 +147,9 @@ curl localhost:9090/debug/vars   # accepted, rejected{reason}, fsync_*, batch_*,
 
 ## Configuration
 
-Every setting is an environment variable and, except the secret, a flag (`-workers 2`).
-**Precedence: flag > environment > default.** `ingestor -h` lists them all. Invalid combinations
+Every setting is an environment variable and, except the secrets, a flag (`-workers 2`).
+**Precedence: flag > environment > default.** An environment variable set to the empty string counts
+as set (`ADMIN_ADDR=` disables the admin listener). `ingestor -h` lists them all. Invalid combinations
 are rejected at startup with a message naming the setting.
 
 | Variable | Default | Description |
@@ -166,18 +170,23 @@ are rejected at startup with a message naming the setting.
 | `SINK_TIMEOUT` | `10s` | Timeout of one delivery request. |
 | `SINK_MAX_ATTEMPTS` | `5` | Attempts per message before the file is postponed. |
 | `SINK_BACKOFF_BASE` / `SINK_BACKOFF_MAX` | `200ms` / `30s` | Per-message retry backoff (exponential, jittered). |
+| `SINK_AUTHORIZATION` | *(empty)* | `Authorization` header sent with every delivery, e.g. `Bearer <token>`. Environment only. |
+| `SINK_HEADERS` | *(empty)* | Extra delivery headers, `Name: value, Name2: value2`. Environment only. |
+| `SINK_PERMANENT_STATUSES` | `400,413,415,422` | Destination statuses that dead-letter a message; every other failure is retried. |
 | `FILE_RETRY_BASE` / `FILE_RETRY_MAX` | `1s` / `1m` | Backoff before a postponed file is retried. |
 | `MAX_FILE_ATTEMPTS` | `0` | Move a file to `failed/` after this many postponements (`0` = never; the backlog limit sheds load instead). |
 | `WEBHOOK_SECRET` | *(empty)* | Enables HMAC-SHA256 verification. Environment only, so it never shows up in a process list. |
 | `WEBHOOK_SIGNATURE_HEADER` | `X-Signature-256` | Header carrying `sha256=<hex>`. |
 | `WEBHOOK_TIMESTAMP_HEADER` | *(empty)* | If set, the MAC covers `<ts>.<body>` and the timestamp must be fresh (anti-replay). |
 | `WEBHOOK_TOLERANCE` | `5m` | Accepted clock skew for the timestamp. |
-| `RATE_LIMIT_PER_MINUTE` | `0` | Per-IP limit (`0` = off). |
+| `RATE_LIMIT_PER_MINUTE` | `0` | Per-client limit (`0` = off). |
+| `TRUSTED_PROXIES` | *(empty)* | IPs or CIDRs of reverse proxies whose `PROXY_HEADER` carries the client IP. Without it the limit keys on the TCP peer, which behind a proxy is the proxy itself. |
+| `PROXY_HEADER` | `X-Forwarded-For` | Header believed from `TRUSTED_PROXIES`; a chain is walked from the right past the trusted hops. |
 | `READ_TIMEOUT` / `WRITE_TIMEOUT` / `IDLE_TIMEOUT` | `10s` / `15s` / `60s` | HTTP timeouts. Idle keep-alive connections are closed, so they cannot hold slots or block shutdown. |
 | `ACK_TIMEOUT` | `5s` | Max wait for the disk before answering `503`. Must be below `WRITE_TIMEOUT`. |
 | `MAX_CONNECTIONS` | `10000` | Max concurrent HTTP connections. |
-| `SHUTDOWN_TIMEOUT` | `15s` | Grace period at shutdown. |
-| `ADMIN_ADDR` | `127.0.0.1:9090` | Health/metrics listener (empty = disabled). |
+| `SHUTDOWN_TIMEOUT` | `15s` | Grace period at shutdown; the whole sequence fits in it. Give the supervisor a longer stop timeout. |
+| `ADMIN_ADDR` | `127.0.0.1:9090` | Health/metrics listener (`ADMIN_ADDR=` disables it). It has no authentication: keep it on localhost or a trusted network. |
 | `ADMIN_PPROF` | `false` | Expose `/debug/pprof` on the admin listener. |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `text` | `debug`/`info`/`warn`/`error`; `text` or `json` (structured, via `log/slog`). |
 
@@ -198,8 +207,12 @@ type Sink interface {
 * Return any other error for a transient failure: it is retried with backoff; if it persists the file is kept and retried later. **Nothing after the failed message is skipped or deleted.**
 * `key` is `<file>:<line>`, deterministic: use it to deduplicate.
 
-The built-in `HTTPSink` (`SINK_URL`) does a `POST` with `Content-Type: application/json` and `Idempotency-Key`.
-`2xx` is success; `408`, `425`, `429`, `5xx` and network errors are transient; every other status is permanent.
+The built-in HTTP sink (`SINK_URL`) does a `POST` with `Content-Type: application/json`, `Idempotency-Key`,
+`SINK_AUTHORIZATION` and `SINK_HEADERS`. `2xx` is success; `400`, `413`, `415` and `422` are permanent
+(`SINK_PERMANENT_STATUSES`); everything else is transient and retried, on purpose: a `401`/`403` after a
+credential rotation or a `404` during a deploy is a misconfiguration to fix, not a reason to dead-letter a
+backlog. Redirects are never followed (a `301`/`302` would turn the `POST` into a body-less `GET`), so a `3xx`
+is a transient error until `SINK_URL` is fixed. Credentials inside `SINK_URL` are rejected: use `SINK_AUTHORIZATION`.
 
 ### Replaying dead letters
 
@@ -218,6 +231,7 @@ done
 and `TimeoutStopSec=30` (longer than `SHUTDOWN_TIMEOUT`). Keep the secret in `/etc/wal-ingestor/wal-ingestor.env` (`chmod 600`).
 
 ```bash
+sudo useradd --system --home-dir /var/lib/wal-ingestor --shell /usr/sbin/nologin wal-ingestor
 go build -o /usr/local/bin/wal-ingestor ./cmd/ingestor
 sudo cp deploy/wal-ingestor.service /etc/systemd/system/
 sudo systemctl enable --now wal-ingestor
@@ -230,18 +244,23 @@ docker build -t wal-ingestion-engine .
 docker run -p 8080:8080 -v wal-data:/data -e SINK_URL=http://host.docker.internal:9000/events wal-ingestion-engine
 ```
 
+Stop it with `docker stop -t 30` (`stop_grace_period: 30s` in Compose, `terminationGracePeriodSeconds: 30` in
+Kubernetes): the default 10 s grace period is shorter than `SHUTDOWN_TIMEOUT`. The image binds the admin listener
+on `0.0.0.0:9090` so orchestrator probes can reach it; it has no authentication, so publish that port only on a
+trusted network.
+
 ### Graceful shutdown
 
 On `SIGINT`/`SIGTERM` the engine, in this order: stops accepting connections and lets in-flight requests finish
 and get their ACK → commits and closes the WAL → stops the workers, which save their checkpoint. Files not
 finished stay in `processing/` and resume on the next start; the final log line reports how many.
-A `SIGKILL` is also safe, only less tidy.
+The whole sequence completes within `SHUTDOWN_TIMEOUT`. A `SIGKILL` is also safe, only less tidy.
 
 ---
 
 ## Tuning
 
-* **Throughput is bounded by `fsync` latency, not by the HTTP stack.** The group commit amortises one `fsync` across every request that arrived meanwhile, so more concurrency means bigger batches, not slower ones.
+* **Throughput is bounded by `fsync` latency, not by the HTTP stack.** The group commit amortises one `fsync` across every request that arrived meanwhile, so more concurrency means bigger batches, not slower ones. Rotations hand the file over on their own goroutine, so a rename never delays a commit.
 * **Slow backend?** Raise `WORKERS` first. If it is down for long, `MAX_BACKLOG_BYTES` turns the growing backlog into `503`s instead of filling the disk; the sender retries.
 * **Many connections:** raise the file descriptor limit (`ulimit -n 65535`, or `LimitNOFILE` in systemd).
 * **Benchmarks** (see [`docs/benchmarks.md`](docs/benchmarks.md)): on the development machine, 1 connection went from 10 to ~1,750 req/s and 64 connections from 632 to ~37,700 req/s versus v1.
@@ -269,7 +288,12 @@ make test-short    # skip the end-to-end tests
 make race          # with the race detector (needs a C toolchain)
 make bench         # WAL micro-benchmarks
 make lint          # golangci-lint
+make vuln          # govulncheck
+make check         # everything CI runs: fmt, vet, lint, vuln, test
 ```
+
+CI (`.github/workflows/ci.yml`) runs gofmt, vet and the race tests on Linux and Windows, golangci-lint,
+govulncheck and the Docker build on every push and pull request.
 
 The end-to-end tests (`internal/e2e`) build the real binary, point it at a fake backend and `kill -9` it
 mid-load, then check that every acknowledged message reached the backend. `docs/regressions.md` lists the

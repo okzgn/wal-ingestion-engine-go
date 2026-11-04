@@ -13,9 +13,13 @@ EnvironmentFile=-/etc/wal-ingestor/wal-ingestor.env
 Environment=LISTEN_ADDR=:8080
 Environment=DATA_DIR=/var/lib/wal-ingestor
 
+# Create the account first:
+#   useradd --system --home-dir /var/lib/wal-ingestor --shell /usr/sbin/nologin wal-ingestor
 User=wal-ingestor
 Group=wal-ingestor
 StateDirectory=wal-ingestor
+StateDirectoryMode=0700
+UMask=0077
 
 Restart=always
 RestartSec=2
@@ -35,9 +39,24 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
 ReadWritePaths=/var/lib/wal-ingestor
 # Only needed to listen on a port below 1024 (for example LISTEN_ADDR=:80):
 #AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

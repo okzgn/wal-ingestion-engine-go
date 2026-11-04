@@ -3,6 +3,7 @@ package spool
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/metrics"
@@ -16,7 +17,7 @@ type Dispatcher struct {
 	cond   *sync.Cond
 	queue  []string
 	known  map[string]int64 // path -> size, for queued, delayed and in-flight files
-	bytes  int64
+	bytes  atomic.Int64     // read lock-free by every webhook request
 	timers map[*time.Timer]struct{}
 	closed bool
 }
@@ -39,7 +40,7 @@ func (d *Dispatcher) Add(path string, size int64) bool {
 		return false
 	}
 	d.known[path] = size
-	d.bytes += size
+	d.bytes.Add(size)
 	d.queue = append(d.queue, path)
 	d.publish()
 	d.cond.Signal()
@@ -76,7 +77,7 @@ func (d *Dispatcher) Done(path string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if size, ok := d.known[path]; ok {
-		d.bytes -= size
+		d.bytes.Add(-size)
 		delete(d.known, path)
 	}
 	d.publish()
@@ -104,12 +105,9 @@ func (d *Dispatcher) Requeue(path string, delay time.Duration) {
 	d.timers[t] = struct{}{}
 }
 
-// BacklogBytes is the total size of files not yet fully processed.
-func (d *Dispatcher) BacklogBytes() int64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.bytes
-}
+// BacklogBytes is the total size of files not yet fully processed. It is
+// called on every request, so it does not take the lock.
+func (d *Dispatcher) BacklogBytes() int64 { return d.bytes.Load() }
 
 // BacklogFiles is the number of files not yet fully processed.
 func (d *Dispatcher) BacklogFiles() int {
@@ -134,5 +132,5 @@ func (d *Dispatcher) Close() {
 // publish mirrors the backlog into the metrics. Callers hold d.mu.
 func (d *Dispatcher) publish() {
 	metrics.BacklogFiles.Set(int64(len(d.known)))
-	metrics.BacklogBytes.Set(d.bytes)
+	metrics.BacklogBytes.Set(d.bytes.Load())
 }
