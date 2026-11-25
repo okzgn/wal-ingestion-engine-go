@@ -186,9 +186,41 @@ func TestParseSize(t *testing.T) {
 			t.Errorf("ParseSize(%q) = %d, %v; want %d", in, got, err, want)
 		}
 	}
+	if got, err := ParseSize("8589934591GiB"); err != nil || got != 8589934591<<30 {
+		t.Errorf("the largest size that fits must parse: %d, %v", got, err)
+	}
+	// An overflow used to wrap around silently, sometimes into a positive size.
+	for _, in := range []string{"8589934592GiB", "99999999999GiB", "9223372036854775807KB"} {
+		if _, err := ParseSize(in); err == nil || !strings.Contains(err.Error(), "too large") {
+			t.Errorf("ParseSize(%q) must report an overflow, got %v", in, err)
+		}
+	}
 	for _, in := range []string{"", "x", "-1", "1.5MiB", "MiB", "1TB"} {
 		if _, err := ParseSize(in); err == nil {
 			t.Errorf("ParseSize(%q) should fail", in)
+		}
+	}
+}
+
+// "-admin-pprof" used to fail with "flag needs an argument".
+func TestLoad_BooleanFlagNeedsNoValue(t *testing.T) {
+	for args, want := range map[string]bool{
+		"-admin-pprof":       true,
+		"-admin-pprof=true":  true,
+		"-admin-pprof=false": false,
+	} {
+		c, err := Load([]string{args}, env(map[string]string{"ADMIN_PPROF": "false"}))
+		if err != nil || c.AdminPprof != want {
+			t.Errorf("%s: AdminPprof=%v err=%v, want %v", args, c.AdminPprof, err, want)
+		}
+	}
+	if _, err := Load([]string{"-admin-pprof=maybe"}, env(nil)); err == nil {
+		t.Error("a bad boolean must still be rejected")
+	}
+	// Every setting with a true/false default must be registered as boolean.
+	for _, s := range settings(&Config{}) {
+		if (s.def == "true" || s.def == "false") != boolSettings[s.env] {
+			t.Errorf("%s: default %q but boolSettings says %v", s.env, s.def, boolSettings[s.env])
 		}
 	}
 }

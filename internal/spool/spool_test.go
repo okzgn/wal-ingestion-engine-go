@@ -407,3 +407,29 @@ func TestSpool_OldestAge(t *testing.T) {
 		t.Fatalf("age %s, want about a minute", age)
 	}
 }
+
+// failed/ is measured, so it follows what the operator does to it by hand.
+func TestSpool_FailedBytes(t *testing.T) {
+	sp := open(t)
+	sp.failedEvery = 0 // no cache in this test
+	if got := sp.FailedBytes(); got != 0 {
+		t.Fatalf("empty failed/: %d", got)
+	}
+	bad := write(t, sp.Dirs.Failed, "a.list.bad", "1\tinvalid JSON\tnope\n")
+	write(t, sp.Dirs.Failed, "b.list", "0123456789")
+	if got := sp.FailedBytes(); got != 20+10 {
+		t.Fatalf("failed bytes = %d, want 30", got)
+	}
+	if err := os.Remove(bad); err != nil {
+		t.Fatal(err)
+	}
+	if got := sp.FailedBytes(); got != 10 {
+		t.Fatalf("after the operator removed a file: %d, want 10", got)
+	}
+
+	sp.failedEvery = time.Hour // cached: the directory is not read on every request
+	write(t, sp.Dirs.Failed, "c.list.bad", "xxxxx")
+	if got := sp.FailedBytes(); got != 10 {
+		t.Fatalf("within the cache window the value must not change, got %d", got)
+	}
+}

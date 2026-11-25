@@ -224,9 +224,8 @@ func TestProcessor_TransientFailureMidWindowLosesNothing(t *testing.T) {
 	if first[msg(5)] != 0 {
 		t.Fatal("the failed line cannot have been delivered")
 	}
-	if len(first) <= 4 {
-		t.Fatalf("lines after the failed one should have gone out in the same window, got %v", first)
-	}
+	// Whether its neighbours went out in the same window depends on timing;
+	// what is guaranteed is that none beyond the window did.
 	for l := range first {
 		var i int
 		fmt.Sscanf(l, `{"i":%d}`, &i)

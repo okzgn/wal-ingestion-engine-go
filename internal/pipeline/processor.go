@@ -353,10 +353,12 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		// times; if it fails once more it is kept (with its payload) in poison.
 		suspect, rounds = p.suspectLine(path, done)
 		poison          *outcome
+		probed          bool // the one probe of this attempt has been sent
 	)
 	if suspect != 0 {
-		// Probe: let one line beyond the usual window go out, so this attempt
-		// can tell "the destination is down" from "it rejects this message".
+		// Leave room for one line beyond the usual window: it may have to go
+		// out as a probe, to tell "the destination is down" from "it rejects
+		// this message".
 		window++
 	}
 	// Lines a previous attempt at this file delivered beyond its checkpoint.
@@ -480,10 +482,22 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		for lineNo > handled+window && inflight > 0 {
 			settle(<-results)
 		}
+		probing := false
 		if stopping() {
+			// Hear everything that is in flight before deciding: its successes
+			// are the evidence giveUp needs.
+			for inflight > 0 {
+				settle(<-results)
+			}
 			giveUp()
 			if stopping() {
-				break
+				// The suspect failed again and nothing else went out in this
+				// attempt, so nothing can be concluded yet: send this line as a
+				// probe, once. If it gets through, the destination is up.
+				if poison == nil || probed || len(failed) != 1 || dlErr != nil || canceled {
+					break
+				}
+				probing = true
 			}
 		}
 		if ctx.Err() != nil {
@@ -511,6 +525,7 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		default:
 			lp := p.copyLine(line)
 			key := fmt.Sprintf("%s:%d", name, lineNo)
+			probed = probed || probing
 			inflight++
 			go func(n uint64) {
 				results <- outcome{lineNo: n, err: p.deliver(ctx, key, *lp), line: lp}

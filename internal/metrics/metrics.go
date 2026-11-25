@@ -67,6 +67,23 @@ func init() {
 	}))
 }
 
+// failedBytes returns the size of the failed/ directory.
+var failedBytes atomic.Pointer[func() int64]
+
+func init() {
+	// failed_bytes: dead letters and quarantined files. Only the operator
+	// removes them, so a value that keeps growing needs a look.
+	expvar.Publish("failed_bytes", expvar.Func(func() any {
+		if f := failedBytes.Load(); f != nil {
+			return (*f)()
+		}
+		return int64(0)
+	}))
+}
+
+// SetFailedBytes installs the source of failed_bytes.
+func SetFailedBytes(f func() int64) { failedBytes.Store(&f) }
+
 // SetBacklogOldest installs the source of backlog_oldest_seconds.
 func SetBacklogOldest(f func() time.Duration) { backlogOldest.Store(&f) }
 

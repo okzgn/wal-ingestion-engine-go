@@ -19,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -158,6 +157,7 @@ func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
 	)
 	in.cmd.Env = append(in.cmd.Env, extra...)
 	in.cmd.Stderr = in.stderr
+	prepare(in.cmd)
 	if err := in.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -397,11 +397,9 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 	}
 }
 
-// SIGTERM under load: clean exit, and a restart finds everything acknowledged.
+// A shutdown request under load (SIGTERM; CTRL_BREAK on Windows): clean exit,
+// and a restart finds everything acknowledged.
 func TestE2E_GracefulShutdown(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Go cannot deliver SIGTERM to a child on Windows")
-	}
 	ds := newDownstream(t)
 	dir := t.TempDir()
 	in := start(t, dir, ds.srv.URL, "SHUTDOWN_TIMEOUT=10s")
@@ -413,7 +411,12 @@ func TestE2E_GracefulShutdown(t *testing.T) {
 	go func() { defer wg.Done(); acked = in.sendMany("g", 100000, 16, stop) }()
 	time.Sleep(700 * time.Millisecond)
 
-	if err := in.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := interrupt(in.cmd); err != nil {
+		close(stop)
+		wg.Wait()
+		if runtime.GOOS == "windows" {
+			t.Skipf("cannot send a console control event here (no console?): %v", err)
+		}
 		t.Fatal(err)
 	}
 	select {

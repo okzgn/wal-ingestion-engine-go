@@ -197,6 +197,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		AckTimeout:         cfg.AckTimeout,
 		MaxBacklogBytes:    cfg.MaxBacklogBytes,
 		MaxBodyMemory:      cfg.MaxBodyMemory,
+		MaxFailedBytes:     cfg.MaxFailedBytes,
 		RateLimitPerMinute: cfg.RateLimitPerMinute,
 		TrustedProxies:     cfg.TrustedProxies,
 		ProxyHeader:        cfg.ProxyHeader,
@@ -218,6 +219,9 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 				}
 				if cfg.MaxBacklogBytes > 0 && sp.BacklogBytes() > cfg.MaxBacklogBytes {
 					return false, "processing backlog is full"
+				}
+				if cfg.MaxFailedBytes > 0 && sp.FailedBytes() > cfg.MaxFailedBytes {
+					return false, "dead-letter directory is full"
 				}
 				return true, ""
 			},

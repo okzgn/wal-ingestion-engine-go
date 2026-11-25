@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -45,6 +46,7 @@ type Config struct {
 	MaxInflightBytes int64
 	MaxBacklogBytes  int64
 	MaxBodyMemory    int64
+	MaxFailedBytes   int64
 
 	Workers               int
 	SinkConcurrency       int
@@ -105,6 +107,7 @@ func settings(c *Config) []setting {
 		{"QUEUE_SIZE", "queue-size", "4096", "capacity of the writer queue", num(&c.QueueSize)},
 		{"MAX_INFLIGHT_BYTES", "max-inflight-bytes", "64MiB", "503 above this many bytes waiting for the disk", size(&c.MaxInflightBytes)},
 		{"MAX_BACKLOG_BYTES", "max-backlog-bytes", "1GiB", "503 above this much unprocessed data on disk", size(&c.MaxBacklogBytes)},
+		{"MAX_FAILED_BYTES", "max-failed-bytes", "0", "503 while failed/ holds more than this (0 = no limit)", size(&c.MaxFailedBytes)},
 		{"MAX_BODY_MEMORY", "max-body-memory", "256MiB", "503 above this many bytes of request bodies in memory at once (0 = no limit)", size(&c.MaxBodyMemory)},
 
 		{"WORKERS", "workers", "4", "files processed at the same time", num(&c.Workers)},
@@ -165,7 +168,7 @@ func Load(args []string, lookup func(string) (string, bool)) (*Config, error) {
 			return nil, fmt.Errorf("%s: %w", s.env, err)
 		}
 		if s.flag != "" {
-			fs.String(s.flag, v, s.usage+" [$"+s.env+"]")
+			fs.Var(&flagValue{value: v, isBool: boolSettings[s.env]}, s.flag, s.usage+" [$"+s.env+"]")
 		}
 	}
 	if err := fs.Parse(args); err != nil {
@@ -192,6 +195,23 @@ func Load(args []string, lookup func(string) (string, bool)) (*Config, error) {
 	}
 	return c, nil
 }
+
+// boolSettings are the on/off settings: their flag works without a value
+// ("-admin-pprof"), like every boolean flag of the standard library.
+var boolSettings = map[string]bool{"ADMIN_PPROF": true}
+
+// flagValue holds a flag as text until the setting parses it, so a flag and
+// its environment variable go through exactly the same parser.
+type flagValue struct {
+	value  string
+	isBool bool
+}
+
+func (f *flagValue) String() string     { return f.value }
+func (f *flagValue) Set(v string) error { f.value = v; return nil }
+
+// IsBoolFlag lets the flag package accept the flag without a value.
+func (f *flagValue) IsBoolFlag() bool { return f.isBool }
 
 // Usage describes every setting, for -h output and the README.
 func Usage() string {
@@ -520,6 +540,9 @@ func ParseSize(s string) (int64, error) {
 	n, err := strconv.ParseInt(t, 10, 64)
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("not a size (e.g. 512KiB, 1MiB, 64MB): %q", s)
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size too large: %q", s)
 	}
 	return n * mult, nil
 }

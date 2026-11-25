@@ -47,6 +47,14 @@ type Spool struct {
 	stop          chan struct{}
 	done          chan struct{}
 	closeOnce     sync.Once
+
+	// The size of failed/ is measured, not counted, so it stays right when an
+	// operator replays or deletes dead letters by hand. The result is cached
+	// for failedEvery: it is asked for on every request.
+	failedMu    sync.Mutex
+	failedEvery time.Duration
+	failedAt    time.Time
+	failedSize  int64
 }
 
 type strandedFile struct {
@@ -78,13 +86,38 @@ func Open(root string, log *slog.Logger) (*Spool, error) {
 		rename:   func(oldPath, newPath string) error { return fsutil.RenameWithRetry(oldPath, newPath, 5) },
 		retryMin: time.Second,
 		retryMax: 30 * time.Second,
-		wake:     make(chan struct{}, 1),
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+
+		failedEvery: 5 * time.Second,
+		wake:        make(chan struct{}, 1),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 	metrics.SetBacklogOldest(s.oldestAge)
+	metrics.SetFailedBytes(s.FailedBytes)
 	go s.retryStranded()
 	return s, nil
+}
+
+// FailedBytes is how much failed/ holds: dead letters and quarantined files.
+// Nothing ever removes them but the operator, so this only grows on its own.
+func (s *Spool) FailedBytes() int64 {
+	s.failedMu.Lock()
+	defer s.failedMu.Unlock()
+	if !s.failedAt.IsZero() && time.Since(s.failedAt) < s.failedEvery {
+		return s.failedSize
+	}
+	entries, err := os.ReadDir(s.Dirs.Failed)
+	if err != nil {
+		return s.failedSize // keep the last known value
+	}
+	var total int64
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && !e.IsDir() {
+			total += info.Size()
+		}
+	}
+	s.failedSize, s.failedAt = total, time.Now()
+	return total
 }
 
 // oldestAge is how long the oldest undelivered file has been waiting.

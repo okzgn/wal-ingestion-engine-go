@@ -36,6 +36,12 @@ type Backlog interface {
 	BacklogBytes() int64
 }
 
+// deadLetterSizer is implemented by a Backlog that can also tell how much the
+// dead-letter directory holds (the spool does).
+type deadLetterSizer interface {
+	FailedBytes() int64
+}
+
 // Config configures the HTTP server.
 type Config struct {
 	Endpoint           string
@@ -47,6 +53,12 @@ type Config struct {
 	AckTimeout         time.Duration
 	MaxBacklogBytes    int64
 	RateLimitPerMinute int
+
+	// MaxFailedBytes sheds load (503) while the dead-letter directory holds
+	// more than this (0 = no limit). Nothing empties that directory but the
+	// operator: without a limit a stream of rejected messages fills the disk,
+	// and a full disk stops everything, not only the rejected ones.
+	MaxFailedBytes int64
 
 	// MaxBodyMemory bounds the request bodies held in memory at once, across
 	// every connection (0 = no bound). Bodies are read by the handler, after
@@ -79,6 +91,7 @@ type Server struct {
 	app     *fiber.App
 	w       Appender
 	backlog Backlog
+	dead    deadLetterSizer // nil when the backlog cannot report it
 	ver     *Verifier
 	log     *slog.Logger
 	pool    sync.Pool
@@ -119,6 +132,9 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 		failed:       logutil.NewThrottle(time.Second),
 	}
 	s.pool.New = func() any { return new(bytes.Buffer) }
+	if d, ok := backlog.(deadLetterSizer); ok {
+		s.dead = d
+	}
 	if cfg.Secret != "" {
 		s.ver = NewSchemeVerifier(cfg.SignatureScheme, cfg.Secret, cfg.TimestampHeader != "", cfg.Tolerance)
 	}
@@ -210,6 +226,10 @@ func (s *Server) webhook(c fiber.Ctx) error {
 	if s.backlog != nil && s.cfg.MaxBacklogBytes > 0 && s.backlog.BacklogBytes() > s.cfg.MaxBacklogBytes {
 		s.release(buf)
 		return s.unavailable(c, "backlog_full", "the processing backlog is full")
+	}
+	if s.dead != nil && s.cfg.MaxFailedBytes > 0 && s.dead.FailedBytes() > s.cfg.MaxFailedBytes {
+		s.release(buf)
+		return s.unavailable(c, "failed_full", "the dead-letter directory is full")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.AckTimeout)
