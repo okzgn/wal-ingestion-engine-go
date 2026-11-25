@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -55,4 +57,22 @@ func (d Dirs) Create() error {
 // only disambiguates concurrent files).
 func NewName(now time.Time, seq uint64, pid int) string {
 	return fmt.Sprintf("ingest_%020d_%06d_%d%s", now.UTC().UnixNano(), seq, pid, FileExt)
+}
+
+// TimeOf returns when the WAL file called name was created, as encoded by
+// NewName. It reports false for a name that does not follow that format.
+func TimeOf(name string) (time.Time, bool) {
+	rest, ok := strings.CutPrefix(name, "ingest_")
+	if !ok {
+		return time.Time{}, false
+	}
+	stamp, _, ok := strings.Cut(rest, "_")
+	if !ok {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(stamp, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, ns), true
 }

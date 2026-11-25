@@ -82,8 +82,25 @@ func Open(root string, log *slog.Logger) (*Spool, error) {
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
+	metrics.SetBacklogOldest(s.oldestAge)
 	go s.retryStranded()
 	return s, nil
+}
+
+// oldestAge is how long the oldest undelivered file has been waiting.
+func (s *Spool) oldestAge() time.Duration {
+	oldest, found := s.Disp.Oldest()
+	s.mu.Lock()
+	for _, f := range s.stranded {
+		if t, ok := TimeOf(filepath.Base(f.path)); ok && (!found || t.Before(oldest)) {
+			oldest, found = t, true
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return 0
+	}
+	return max(time.Since(oldest), 0)
 }
 
 // Close stops the handoff retries and releases the instance lock. Files that

@@ -166,6 +166,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 			FailedDir:          sp.Dirs.Failed,
 			MaxLineSize:        config.MaxMessageSizeLimit,
 			Concurrency:        cfg.SinkConcurrency,
+			MaxLineAttempts:    cfg.MaxLineAttempts,
 			CheckpointInterval: cfg.CheckpointInterval,
 			Retry:              pipeline.RetryPolicy{MaxAttempts: cfg.SinkMaxAttempts, BaseDelay: cfg.SinkBackoffBase, MaxDelay: cfg.SinkBackoffMax},
 			Logger:             log,

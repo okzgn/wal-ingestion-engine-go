@@ -59,6 +59,7 @@ type Config struct {
 	FileRetryBase         time.Duration
 	FileRetryMax          time.Duration
 	MaxFileAttempts       int
+	MaxLineAttempts       int
 
 	WebhookSecret          string
 	WebhookSignatureHeader string
@@ -115,7 +116,8 @@ func settings(c *Config) []setting {
 		{"SINK_PERMANENT_STATUSES", "sink-permanent-statuses", "400,413,415,422", "destination statuses that dead-letter a message instead of retrying it", ints(&c.SinkPermanentStatuses)},
 		{"FILE_RETRY_BASE", "file-retry-base", "1s", "first delay before a postponed file is retried", dur(&c.FileRetryBase)},
 		{"FILE_RETRY_MAX", "file-retry-max", "1m", "postponed file retry delay cap", dur(&c.FileRetryMax)},
-		{"MAX_FILE_ATTEMPTS", "max-file-attempts", "0", "move a file to failed/ after this many postponements (0 = never)", num(&c.MaxFileAttempts)},
+		{"MAX_FILE_ATTEMPTS", "max-file-attempts", "0", "move a file to failed/ after it is postponed this many times on the same message (0 = never)", num(&c.MaxFileAttempts)},
+		{"MAX_LINE_ATTEMPTS", "max-line-attempts", "10", "dead-letter a message after it stalls its file this many times while the destination accepts others (0 = never)", num(&c.MaxLineAttempts)},
 
 		{"WEBHOOK_SECRET", "", "", "HMAC-SHA256 secret; enables signature verification", str(&c.WebhookSecret)},
 		{"WEBHOOK_SIGNATURE_HEADER", "webhook-signature-header", "X-Signature-256", "header carrying sha256=<hex>", str(&c.WebhookSignatureHeader)},
@@ -279,6 +281,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxFileAttempts < 0 {
 		bad("MAX_FILE_ATTEMPTS must not be negative")
+	}
+	if c.MaxLineAttempts < 0 {
+		bad("MAX_LINE_ATTEMPTS must not be negative (0 never gives up on a message)")
 	}
 	if c.WebhookSignatureHeader == "" {
 		bad("WEBHOOK_SIGNATURE_HEADER must not be empty")

@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/fsutil"
@@ -73,6 +75,13 @@ type Options struct {
 	// Concurrency lines per file. With 1 the file is delivered strictly in order.
 	Concurrency int
 
+	// MaxLineAttempts gives up on a message that keeps stalling its file: once
+	// it has stalled the file this many times in a row, the next failure
+	// dead-letters it, but only if the destination accepted another message
+	// during that same attempt (so an outage never dead-letters anything).
+	// 0 never gives up.
+	MaxLineAttempts int
+
 	CheckpointInterval int
 	Retry              RetryPolicy
 	Logger             *slog.Logger
@@ -88,6 +97,11 @@ type Processor struct {
 
 	carryMu sync.Mutex
 	carry   map[string]map[uint64]struct{} // see carryOver
+	stalls  map[string]stall               // per file: the line it is stuck on
+
+	// successes counts the deliveries that succeeded, on any file. A change
+	// during an attempt is the evidence that the destination is up.
+	successes atomic.Uint64
 
 	// remove deletes a finished file or its checkpoint; tests inject faults here.
 	remove func(path string) error
@@ -126,6 +140,7 @@ func NewProcessor(o Options) *Processor {
 		remove:   func(path string) error { return fsutil.RemoveWithRetry(path, 5) },
 	}
 	p.carry = map[string]map[uint64]struct{}{}
+	p.stalls = map[string]stall{}
 	p.bufs.New = func() any { return new([]byte) }
 	return p
 }
@@ -181,7 +196,67 @@ func (p *Processor) takeCarry(path string) map[uint64]struct{} {
 
 // Forget drops what the processor remembers about a file that will not be
 // processed again (it was moved away).
-func (p *Processor) Forget(path string) { p.takeCarry(path) }
+func (p *Processor) Forget(path string) {
+	p.takeCarry(path)
+	p.clearStall(path)
+}
+
+// StallError is returned when a file is postponed because the delivery of one
+// of its lines kept failing. It is a kind of ErrRetryLater; Line lets the
+// caller tell a file that is stuck on one message from one that advances
+// between failures.
+type StallError struct {
+	Line uint64
+	Err  error
+}
+
+func (e *StallError) Error() string {
+	return fmt.Sprintf("%v: line %d: %v", ErrRetryLater, e.Line, e.Err)
+}
+
+// Unwrap makes errors.Is(err, ErrRetryLater) hold.
+func (e *StallError) Unwrap() error { return ErrRetryLater }
+
+// stall is how often in a row one line has stalled its file.
+type stall struct {
+	line   uint64
+	rounds int
+}
+
+// noteStall records that line stalled the file once more.
+func (p *Processor) noteStall(path string, line uint64) {
+	p.carryMu.Lock()
+	defer p.carryMu.Unlock()
+	st := p.stalls[path]
+	if st.line != line {
+		st = stall{line: line}
+	}
+	st.rounds++
+	p.stalls[path] = st
+	metrics.StalledLines.Set(int64(len(p.stalls)))
+}
+
+func (p *Processor) clearStall(path string) {
+	p.carryMu.Lock()
+	defer p.carryMu.Unlock()
+	delete(p.stalls, path)
+	metrics.StalledLines.Set(int64(len(p.stalls)))
+}
+
+// suspectLine returns the line that has stalled the file MaxLineAttempts times
+// (0 when there is none, or when giving up is disabled) and how many times.
+func (p *Processor) suspectLine(path string, done uint64) (uint64, int) {
+	if p.o.MaxLineAttempts <= 0 {
+		return 0, 0
+	}
+	p.carryMu.Lock()
+	defer p.carryMu.Unlock()
+	st := p.stalls[path]
+	if st.rounds < p.o.MaxLineAttempts || st.line <= done {
+		return 0, 0
+	}
+	return st.line, st.rounds
+}
 
 // outcome is the result of delivering one line.
 type outcome struct {
@@ -267,11 +342,23 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		settled  = map[uint64]bool{} // lines beyond the prefix already dealt with; true = delivered
 		nextSave = done + p.interval
 
-		stalled  *outcome // the lowest line whose delivery kept failing
-		dlErr    error    // a dead letter could not be written or synced
+		failed   = map[uint64]error{} // lines whose delivery kept failing: NOT settled
+		dlErr    error                // a dead letter could not be written or synced
 		canceled bool
 		readErr  error
+
+		before = p.successes.Load() // see giveUp
+		window = p.window
+		// suspect is the line that has already stalled this file MaxLineAttempts
+		// times; if it fails once more it is kept (with its payload) in poison.
+		suspect, rounds = p.suspectLine(path, done)
+		poison          *outcome
 	)
+	if suspect != 0 {
+		// Probe: let one line beyond the usual window go out, so this attempt
+		// can tell "the destination is down" from "it rejects this message".
+		window++
+	}
 	// Lines a previous attempt at this file delivered beyond its checkpoint.
 	for n := range p.takeCarry(path) {
 		if n > done {
@@ -320,14 +407,42 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 			// checkpoint, stops right before it and nothing after it is skipped
 			// or deleted. Later lines that did get through are remembered (see
 			// carryOver) so the next attempt does not deliver them twice.
-			if stalled == nil || o.lineNo < stalled.lineNo {
-				stalled = &outcome{lineNo: o.lineNo, err: o.err}
+			failed[o.lineNo] = o.err
+			if o.lineNo == suspect {
+				poison = &outcome{lineNo: o.lineNo, err: o.err, line: o.line}
+				o.line = nil // kept: it may have to be dead-lettered
 			}
+		}
+		if o.err == nil {
+			p.successes.Add(1)
 		}
 		p.freeLine(o.line)
 		advance()
 	}
-	stopping := func() bool { return stalled != nil || dlErr != nil || canceled }
+	stopping := func() bool { return len(failed) > 0 || dlErr != nil || canceled }
+	// giveUp dead-letters the suspect line when it has failed again while the
+	// destination accepted another message during this very attempt: fresh
+	// evidence that the destination is up and it is this message it cannot
+	// take. Without that evidence nothing is given up, however long it lasts.
+	giveUp := func() {
+		if poison == nil || dlErr != nil || canceled || p.successes.Load() == before {
+			return
+		}
+		reason := fmt.Sprintf("gave up: the message stalled its file %d times while the destination accepted others; last error: %v", rounds+1, poison.err)
+		if err := deadLetter(poison.lineNo, reason, *poison.line); err != nil {
+			dlErr = err
+			return
+		}
+		log.Error("message given up on and dead-lettered; the destination accepts other messages but not this one",
+			"line", poison.lineNo, "rounds", rounds+1, "err", poison.err)
+		metrics.GivenUp.Add(1)
+		settled[poison.lineNo] = false
+		delete(failed, poison.lineNo)
+		p.freeLine(poison.line)
+		poison = nil
+		p.clearStall(path)
+		advance()
+	}
 
 	lr := newLineReader(f, p.o.MaxLineSize)
 	var lineNo uint64
@@ -362,11 +477,14 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 				more = false
 			}
 		}
-		for lineNo > handled+p.window && inflight > 0 {
+		for lineNo > handled+window && inflight > 0 {
 			settle(<-results)
 		}
 		if stopping() {
-			break
+			giveUp()
+			if stopping() {
+				break
+			}
 		}
 		if ctx.Err() != nil {
 			canceled = true
@@ -411,6 +529,12 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 	for inflight > 0 {
 		settle(<-results)
 	}
+	if stopping() {
+		giveUp()
+	}
+	if poison != nil {
+		p.freeLine(poison.line)
+	}
 	if stopping() || readErr != nil {
 		p.carryOver(path, settled)
 	}
@@ -425,14 +549,26 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		checkpoint()
 		release()
 		return ctx.Err()
-	case stalled != nil:
-		log.Warn("sink keeps failing; postponing file", "line", stalled.lineNo, "err", stalled.err)
+	case len(failed) > 0:
+		first := uint64(math.MaxUint64)
+		for n := range failed {
+			first = min(first, n)
+		}
+		p.noteStall(path, first)
+		log.Warn("sink keeps failing; postponing file", "line", first, "err", failed[first])
 		checkpoint()
-		return postpone(fmt.Errorf("line %d: %w", stalled.lineNo, stalled.err))
+		release()
+		return &StallError{Line: first, Err: failed[first]}
 	case readErr != nil:
 		checkpoint()
 		return postpone(fmt.Errorf("read: %w", readErr))
+	case handled != lineNo:
+		// Cannot happen: every line read is settled by now. If it ever did,
+		// deleting the file would lose what lies beyond the prefix.
+		checkpoint()
+		return postpone(fmt.Errorf("internal error: %d of %d lines handled", handled, lineNo))
 	}
+	p.clearStall(path)
 
 	// The file is deleted only once every dead letter is durable. The final
 	// checkpoint matters only if the removal below fails.

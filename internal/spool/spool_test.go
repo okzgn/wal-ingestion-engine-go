@@ -374,3 +374,36 @@ func TestSpool_ReadyDropsAFileThatIsGone(t *testing.T) {
 		t.Fatal("a missing file must not be stranded")
 	}
 }
+
+func TestTimeOf(t *testing.T) {
+	when := time.Unix(1_700_000_000, 123)
+	got, ok := TimeOf(NewName(when, 7, 4242))
+	if !ok || !got.Equal(when) {
+		t.Fatalf("TimeOf(NewName(%v)) = %v, %v", when, got, ok)
+	}
+	for _, name := range []string{"", "notes.txt", "ingest_", "ingest_abc_1_1.list", "v1-file.list"} {
+		if _, ok := TimeOf(name); ok {
+			t.Errorf("TimeOf(%q) should not parse", name)
+		}
+	}
+}
+
+// backlog_oldest_seconds is derived from the oldest file still waiting,
+// whether it is queued or stranded in ingestions/.
+func TestSpool_OldestAge(t *testing.T) {
+	sp := open(t)
+	if age := sp.oldestAge(); age != 0 {
+		t.Fatalf("empty backlog: age %s, want 0", age)
+	}
+	recent := write(t, sp.Dirs.Processing, NewName(time.Now().Add(-time.Minute), 1, 1), "a\n")
+	old := write(t, sp.Dirs.Processing, NewName(time.Now().Add(-time.Hour), 2, 1), "b\n")
+	sp.Disp.Add(recent, 2)
+	sp.Disp.Add(old, 2)
+	if age := sp.oldestAge(); age < 59*time.Minute || age > 61*time.Minute {
+		t.Fatalf("age %s, want about an hour", age)
+	}
+	sp.Disp.Done(old)
+	if age := sp.oldestAge(); age < 59*time.Second || age > 2*time.Minute {
+		t.Fatalf("age %s, want about a minute", age)
+	}
+}
