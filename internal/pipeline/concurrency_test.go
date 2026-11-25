@@ -110,29 +110,46 @@ func checkpointOf(t *testing.T, path string) uint64 {
 
 // The reason SINK_CONCURRENCY exists: a file used to be delivered one message
 // at a time, so the drain rate was WORKERS / latency whatever the load.
+//
+// The comparison is between two runs on the same machine, not against the
+// nominal latency: a timer can take longer than asked (15.6 ms steps on
+// Windows) and the race detector slows everything down. Checkpoints are kept
+// out of it (one at the very end): an fsync on a slow disk costs more than a
+// delivery, and it is the delivery that is being measured.
 func TestProcessor_ConcurrentDeliveryIsFaster(t *testing.T) {
-	const n, delay = 80, 10 * time.Millisecond
-	s := &slowSink{delay: delay}
-	e := concurrentEnv(t, s, 8, nil)
-	p := e.writeFile(t, "fast.list", numbered(n))
+	const n, delay = 60, 10 * time.Millisecond
+	run := func(concurrency int) (time.Duration, *slowSink) {
+		s := &slowSink{delay: delay}
+		e := concurrentEnv(t, s, concurrency, func(o *Options) { o.CheckpointInterval = 10 * n })
+		p := e.writeFile(t, "fast.list", numbered(n))
+		start := time.Now()
+		if err := e.proc.ProcessFile(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		elapsed := time.Since(start)
+		if c := s.counts(); len(c) != n {
+			t.Fatalf("concurrency %d: delivered %d distinct messages, want %d", concurrency, len(c), n)
+		}
+		if exists(p) || exists(p+spool.CheckpointExt) {
+			t.Fatalf("concurrency %d: file or checkpoint left behind", concurrency)
+		}
+		return elapsed, s
+	}
 
-	start := time.Now()
-	if err := e.proc.ProcessFile(context.Background(), p); err != nil {
-		t.Fatal(err)
-	}
-	elapsed := time.Since(start)
+	sequential, one := run(1)
+	concurrent, eight := run(8)
 
-	if sequential := n * delay; elapsed > sequential/2 {
-		t.Fatalf("80 messages at 10 ms took %s; one at a time takes %s", elapsed, sequential)
+	if peak := one.peak.Load(); peak != 1 {
+		t.Fatalf("concurrency 1: peak %d, want 1", peak)
 	}
-	if peak := s.peak.Load(); peak < 2 || peak > 8 {
-		t.Fatalf("peak concurrency %d, want within 2..8", peak)
+	// What makes it faster, checked directly: the deliveries really overlap,
+	// and never beyond the limit.
+	if peak := eight.peak.Load(); peak < 4 || peak > 8 {
+		t.Fatalf("concurrency 8: peak %d, want within 4..8", peak)
 	}
-	if c := s.counts(); len(c) != n {
-		t.Fatalf("delivered %d distinct messages, want %d", len(c), n)
-	}
-	if exists(p) || exists(p+spool.CheckpointExt) {
-		t.Fatal("file or checkpoint left behind")
+	// 8 at a time should be about 8 times faster; 3 leaves room for a busy runner.
+	if concurrent > sequential/3 {
+		t.Fatalf("%d messages took %s one at a time and %s with concurrency 8: want at least 3 times faster", n, sequential, concurrent)
 	}
 }
 
@@ -170,7 +187,7 @@ func TestProcessor_CheckpointIsContiguousPrefix(t *testing.T) {
 	go func() { done <- e.proc.ProcessFile(context.Background(), p) }()
 
 	// Lines 1 and 2 complete; 3 is stuck; the window then lets 4, 5 and 6 through.
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for len(s.got()) < 5 {
 		if time.Now().After(deadline) {
 			t.Fatalf("delivered only %v", s.got())

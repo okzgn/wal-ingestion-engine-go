@@ -721,7 +721,7 @@ func TestRunner_RetriesRemovalWithoutRedelivery(t *testing.T) {
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for exists(path) || sp.Disp.BacklogFiles() != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the file was never removed")

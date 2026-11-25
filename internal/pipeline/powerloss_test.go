@@ -119,18 +119,35 @@ func TestPowerLoss_AcknowledgedMessagesSurvive(t *testing.T) {
 		}()
 	}
 
+	// The test waits for a number of acknowledgements, not for a length of
+	// time: how many fit in 150 ms depends on how fast the disk syncs, and on a
+	// slow one (a CI runner under the race detector) that was too few to prove
+	// anything.
+	ackedSoFar := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(acked)
+	}
+	waitForAcks := func(n int, limit time.Duration) {
+		for deadline := time.Now().Add(limit); ackedSoFar() < n && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	const enough = 1500 // several rotations of the 4 KiB files
+	waitForAcks(enough, 30*time.Second)
+
 	// The instant of the power loss. Order matters: the acknowledgements are
 	// read first, so each of them precedes the disk state read after it.
-	time.Sleep(150 * time.Millisecond)
 	mu.Lock()
 	before := append([]string(nil), acked...)
 	mu.Unlock()
 	atLoss := d.snapshot()
 
-	time.Sleep(100 * time.Millisecond) // the engine carries on: none of this survives
+	// The engine carries on for a while: none of this survives.
+	waitForAcks(len(before)+enough/2, 5*time.Second)
 	stop.Store(true)
 	wg.Wait()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := w.Close(ctx); err != nil {
 		t.Fatal(err)
@@ -138,8 +155,8 @@ func TestPowerLoss_AcknowledgedMessagesSurvive(t *testing.T) {
 	if err := sp.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(before) < 100 {
-		t.Fatalf("only %d messages acknowledged before the loss: the test proves nothing", len(before))
+	if len(before) < enough {
+		t.Fatalf("only %d messages acknowledged in 30 s: the disk is too slow for this test to prove anything", len(before))
 	}
 
 	// Rebuild the disk as it was at the loss.

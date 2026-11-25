@@ -180,7 +180,7 @@ func TestRunner_FileAttemptsResetOnProgress(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.Run(ctx); close(done) }()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for exists(path) {
 		if time.Now().After(deadline) {
 			t.Fatal("file never completed")

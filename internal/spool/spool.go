@@ -66,6 +66,13 @@ type strandedFile struct {
 // instance on the same directory would otherwise move the first one's active
 // file out from under it.
 func Open(root string, log *slog.Logger) (*Spool, error) {
+	return openWith(root, log, nil)
+}
+
+// openWith is Open with a hook that adjusts the spool before its background
+// goroutine starts. Tests use it to inject faults and shorten delays: changing
+// those fields on a spool that is already running would race with that goroutine.
+func openWith(root string, log *slog.Logger, configure func(*Spool)) (*Spool, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -91,6 +98,9 @@ func Open(root string, log *slog.Logger) (*Spool, error) {
 		wake:        make(chan struct{}, 1),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
+	}
+	if configure != nil {
+		configure(s)
 	}
 	metrics.SetBacklogOldest(s.oldestAge)
 	metrics.SetFailedBytes(s.FailedBytes)

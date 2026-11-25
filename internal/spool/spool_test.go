@@ -310,19 +310,24 @@ func TestDispatcher_ConcurrentWorkersGetEachFileOnce(t *testing.T) {
 // backlog, were invisible to the admission limit. The move is now retried in
 // the background, in rotation order, and the bytes count as backlog meanwhile.
 func TestSpool_ReadyRetriesFailedHandoff(t *testing.T) {
-	sp := open(t)
-	sp.retryMin, sp.retryMax = 5*time.Millisecond, 10*time.Millisecond
-
 	var mu sync.Mutex
 	broken := true
-	sp.rename = func(oldPath, newPath string) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if broken {
-			return errors.New("processing/ is read-only")
+	// Configured before the spool starts: its retry goroutine reads these.
+	sp, err := openWith(t.TempDir(), quiet, func(s *Spool) {
+		s.retryMin, s.retryMax = 5*time.Millisecond, 10*time.Millisecond
+		s.rename = func(oldPath, newPath string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if broken {
+				return errors.New("processing/ is read-only")
+			}
+			return os.Rename(oldPath, newPath)
 		}
-		return os.Rename(oldPath, newPath)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = sp.Close() })
 
 	first := write(t, sp.Dirs.Ingestions, NewName(time.Unix(100, 0), 1, 1), "aaaa\n")
 	second := write(t, sp.Dirs.Ingestions, NewName(time.Unix(200, 0), 2, 1), "bb\n")
