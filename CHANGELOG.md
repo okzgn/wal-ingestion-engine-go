@@ -1,5 +1,80 @@
 # Changelog
 
+## v2.2.0
+
+A second review, this time with measurements against the real binary: one way left to lose an
+acknowledged message, a delivery path far slower than ingestion, and several places where the
+engine waited for a restart or for an operator instead of recovering by itself.
+
+**Two defaults change behaviour** (see "Changed"): messages of a file are delivered concurrently,
+and a message the backend keeps failing on is eventually dead-lettered.
+
+### Fixed: data loss
+
+* `MAX_MESSAGE_SIZE` above 16 MiB acknowledged messages that the delivery side then cut to their
+  first 16 MiB in `failed/`. The setting is now capped at 16 MiB at startup, and an oversized line is
+  never truncated again: it is streamed whole to `failed/<file>.bad`, whatever its size.
+
+### Fixed: reliability
+
+* A rotated file that could not be moved to `processing/` stayed in `ingestions/` until the next
+  restart, undelivered and invisible to the backlog limit. The move is now retried in the background
+  with backoff, in rotation order, and the file counts as backlog meanwhile (`handoff_pending`).
+* A processed file that could not be removed left the backlog while staying on disk. Its removal is
+  now retried, without redelivering anything and without counting as a failed attempt.
+* `MAX_FILE_ATTEMPTS` counted every postponement, so a file that advanced between failures during a
+  long, flapping outage ended up quarantined. It now counts consecutive failures on the same message.
+* A body larger than the limit was refused by closing the connection while the client was still
+  sending, which the client often saw as a reset instead of the `413`. The refused body is now read
+  and discarded (bounded) before the connection is closed.
+* A file is never deleted unless every line read from it is accounted for (a defensive check).
+
+### Changed
+
+* **`SINK_CONCURRENCY` (default 8): the messages of a file are delivered concurrently.** A file used
+  to go out one message at a time, so the drain rate was `WORKERS ÷ backend latency` whatever the
+  load: 160 msg/s against a 20 ms backend while ingesting 25,000 req/s. It is now ~1,100 msg/s with
+  the defaults. The checkpoint is still a contiguous prefix of the file, and a transient failure in
+  the middle of the window repeats nothing while the process lives. After a crash up to
+  `CHECKPOINT_INTERVAL - 1 + SINK_CONCURRENCY` lines per in-flight file can be delivered again (it was
+  `CHECKPOINT_INTERVAL - 1`). **In-order delivery now needs `WORKERS=1` and `SINK_CONCURRENCY=1`.**
+  A custom `Sink` must be safe for concurrent use.
+* **`MAX_LINE_ATTEMPTS` (default 10): a message that keeps stalling its file is given up on.** A
+  message the backend answered `500` to every time stalled its file for ever. After it has stalled the
+  file that many times in a row, the next failure dead-letters it (reason `gave up: ...`), but only if
+  another message got through in that same attempt; one line is sent as a probe when needed. A backend
+  that is down never dead-letters anything. `MAX_LINE_ATTEMPTS=0` restores the old behaviour.
+* Request bodies are read by the handler, after being admitted against `MAX_BODY_MEMORY` (default
+  256 MiB), instead of being buffered by the server before any check: up to `MAX_CONNECTIONS ×
+  MAX_MESSAGE_SIZE` (10 GB with the defaults) could be held before a single signature was verified.
+  A chunked body is cut off one byte past the limit. Ingestion throughput is unchanged.
+* `WEBHOOK_SIGNATURE_HEADER` defaults to the header of the chosen scheme (still `X-Signature-256`
+  for `generic`).
+* Boolean flags work without a value (`-admin-pprof`). A size that overflows is reported instead of
+  wrapping around.
+
+### Added
+
+* `WEBHOOK_SIGNATURE_SCHEME`: `github`, `stripe` and `slack` besides `generic`, each with its own
+  headers, signed payload and (stripe, slack) timestamp tolerance. Checked against the documented
+  examples of GitHub and Slack.
+* `SINK_KEY_JSON_POINTER`: the sender's own event id becomes the `Idempotency-Key`, so the backend
+  can also discard an event the sender delivered twice. `X-Delivery-Id` always carries the engine key.
+* `MAX_FAILED_BYTES`: shed load while `failed/` is over a limit (off by default).
+* Metrics to alert on: `backlog_oldest_seconds`, `files_postponed`, `stalled_lines`, `given_up`,
+  `failed_bytes`, `handoff_pending`.
+* Windows: renames between spool directories are written through to disk.
+* Tests: a power-loss simulation that rebuilds the disk from what had been fsynced; the
+  graceful-shutdown end-to-end test now also runs on Windows; `fsutil` is covered.
+  `loadgen -sink-addr` runs a backend with a fixed latency and reports the drain rate.
+* `SECURITY.md`; Dependabot for Go modules, CI actions and Docker images.
+
+### Security
+
+* Go 1.26.11 is the minimum toolchain: 1.26.10 carries GO-2026-6859 (`net/http`), reachable from the
+  sink client and the admin listener. Dependencies upgraded (Fiber v3.7.0, fasthttp v1.80.0).
+* CI actions are pinned to commits and `govulncheck` to a version.
+
 ## v2.1.0
 
 Production-readiness review: two bugs that broke the documented guarantees, a vulnerable

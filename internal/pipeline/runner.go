@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/okzgn/wal-ingestion-engine-go/internal/metrics"
 	"github.com/okzgn/wal-ingestion-engine-go/internal/spool"
 )
 
@@ -24,8 +25,10 @@ type Runner struct {
 	RetryMax        time.Duration // cap of that delay
 	Logger          *slog.Logger
 
-	mu       sync.Mutex
-	attempts map[string]int
+	mu        sync.Mutex
+	attempts  map[string]int
+	cleanups  map[string]int    // rounds spent only retrying the removal of a file
+	stalledAt map[string]uint64 // line each file was last stuck on
 }
 
 // Run starts the workers and blocks until ctx is cancelled and every worker has
@@ -44,6 +47,8 @@ func (r *Runner) Run(ctx context.Context) {
 		r.Logger = slog.Default()
 	}
 	r.attempts = map[string]int{}
+	r.cleanups = map[string]int{}
+	r.stalledAt = map[string]uint64{}
 
 	var wg sync.WaitGroup
 	for i := 0; i < r.Workers; i++ {
@@ -70,8 +75,16 @@ func (r *Runner) worker(ctx context.Context) {
 		case ctx.Err() != nil || errors.Is(err, context.Canceled):
 			// Shutting down: the file stays in processing/ with its checkpoint.
 			return
+		case errors.Is(err, ErrCleanupPending):
+			// Everything was delivered; only the removal is left. It is retried
+			// without counting as a failed attempt: a delivered file must never
+			// end up quarantined in failed/.
+			delay := Backoff(r.bumpCleanup(path), r.RetryBase, r.RetryMax)
+			r.Logger.Warn("processed file not removed yet", "file", path, "retry_in", delay, "err", err)
+			r.Spool.Disp.Requeue(path, delay)
 		default:
-			n := r.bump(path)
+			metrics.FilesPostponed.Add(1)
+			n := r.bump(path, err)
 			if r.MaxFileAttempts > 0 && n >= r.MaxFileAttempts {
 				r.Logger.Error("giving up on file; moving it to failed/", "file", path, "attempts", n, "err", err)
 				if qerr := r.Spool.Quarantine(path); qerr != nil {
@@ -80,6 +93,7 @@ func (r *Runner) worker(ctx context.Context) {
 					continue
 				}
 				r.forget(path)
+				r.Proc.Forget(path)
 				continue
 			}
 			delay := Backoff(n, r.RetryBase, r.RetryMax)
@@ -89,15 +103,35 @@ func (r *Runner) worker(ctx context.Context) {
 	}
 }
 
-func (r *Runner) bump(path string) int {
+// bump counts one more failed attempt at a file. A file that is stuck on a
+// different line than last time has made progress in between, so it starts
+// over: MAX_FILE_ATTEMPTS is about a file that cannot advance, not about one
+// that lives through a long, flapping outage.
+func (r *Runner) bump(path string, err error) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	var se *StallError
+	if errors.As(err, &se) {
+		if last, ok := r.stalledAt[path]; ok && last != se.Line {
+			r.attempts[path] = 0
+		}
+		r.stalledAt[path] = se.Line
+	}
 	r.attempts[path]++
 	return r.attempts[path]
+}
+
+func (r *Runner) bumpCleanup(path string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cleanups[path]++
+	return r.cleanups[path]
 }
 
 func (r *Runner) forget(path string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.attempts, path)
+	delete(r.cleanups, path)
+	delete(r.stalledAt, path)
 }

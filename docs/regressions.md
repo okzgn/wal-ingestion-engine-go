@@ -28,3 +28,23 @@ Findings of the v2.0 review, reproduced before being fixed.
 | R6 | `ADMIN_ADDR=` through the environment | The default value is applied | The admin listener is disabled | `TestLoad_EmptyEnvCountsAsSet` |
 | R7 | Busy port at start | The lock is taken and `DATA_DIR` touched before failing | Fails before touching the data directory | `TestServe_BusyPortFailsBeforeTouchingData` |
 | R8 | Invalid body while the backlog is full | `503` (looks like the engine's fault) | `400` (the sender's fault) | `TestHandler_InvalidJSONIsRefusedEvenWithFullBacklog` |
+
+## Second review (v2.2)
+
+Findings of the v2.1 review. R9, R10 and R14 were reproduced against the real binary before being fixed.
+
+| ID | Scenario | v2.1 behaviour | Expected behaviour | Test |
+|---|---|---|---|---|
+| R9 | `MAX_MESSAGE_SIZE=32MiB`, 20 MiB `POST` | `200`, never delivered, cut to its first 16 MiB in `.bad` | The setting is refused at startup; an oversized line is dead-lettered whole | `TestLoad_Errors`, `TestMessageLimitNeverExceedsTheReaders`, `TestProcessor_OversizeLineIsDeadLetteredWhole` |
+| R10 | 20,000 messages, backend answering in 20 ms | Delivered at 160 msg/s: one message of a file at a time | Concurrent within the file; checkpoint stays a contiguous prefix | `TestProcessor_ConcurrentDeliveryIsFaster`, `TestProcessor_CheckpointIsContiguousPrefix`, `TestProcessor_TransientFailureMidWindowLosesNothing`, `TestProcessor_RedeliveryAfterCrashIsBounded` |
+| R11 | The move of a rotated file to `processing/` fails | File left in `ingestions/` until a restart, outside the backlog | Retried in the background, in order, counted as backlog | `TestSpool_ReadyRetriesFailedHandoff` |
+| R12 | A processed file cannot be removed | Leaves the backlog, stays on disk until a restart | Removal retried, nothing redelivered, never quarantined | `TestRunner_RetriesRemovalWithoutRedelivery` |
+| R13 | `MAX_FILE_ATTEMPTS` during a flapping outage | A file that advances between failures is quarantined | Only consecutive failures on the same message count | `TestRunner_FileAttemptsResetOnProgress` |
+| R14 | Backend answers `500` to one message, every time | Its file is stalled for ever | Dead-lettered after `MAX_LINE_ATTEMPTS`, on evidence that the backend is up; never during an outage | `TestProcessor_PoisonLineIsDeadLetteredWhenSinkIsAlive`, `TestProcessor_NeverGivesUpWhileSinkIsDown` |
+| R15 | Many connections sending bodies at the limit | Up to `MAX_CONNECTIONS × MAX_MESSAGE_SIZE` buffered before any check | Bodies admitted against `MAX_BODY_MEMORY`; chunked bodies cut at the limit | `TestBody_MemoryBudgetSheds503`, `TestBody_ChunkedOversizeIs413`, `TestBody_StalledBodyReleasesItsReservation` |
+| R16 | `-admin-pprof` | `flag needs an argument` | Enables it | `TestLoad_BooleanFlagNeedsNoValue` |
+| R17 | `MAX_BACKLOG_BYTES=99999999999GiB` | Wraps around; reported as "must not be negative", or accepted | "size too large" | `TestParseSize` |
+| R18 | A crash that loses the page cache (power loss) | Not covered: `kill -9` keeps the page cache | Everything acknowledged survives; the torn tail is dead-lettered | `TestPowerLoss_AcknowledgedMessagesSurvive` |
+
+`TestRunner_RetriesPostponedFilesUntilTheSinkRecovers` failed about once in 40 runs before this
+review: it checked the backlog the instant the file disappeared. It now waits for it.

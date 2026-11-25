@@ -304,3 +304,137 @@ func TestDispatcher_ConcurrentWorkersGetEachFileOnce(t *testing.T) {
 		t.Fatalf("backlog not empty: %d", d.BacklogFiles())
 	}
 }
+
+// A failed move to processing/ used to leave the file in ingestions/ until the
+// next restart: acknowledged messages sat undelivered and, not being in the
+// backlog, were invisible to the admission limit. The move is now retried in
+// the background, in rotation order, and the bytes count as backlog meanwhile.
+func TestSpool_ReadyRetriesFailedHandoff(t *testing.T) {
+	var mu sync.Mutex
+	broken := true
+	// Configured before the spool starts: its retry goroutine reads these.
+	sp, err := openWith(t.TempDir(), quiet, func(s *Spool) {
+		s.retryMin, s.retryMax = 5*time.Millisecond, 10*time.Millisecond
+		s.rename = func(oldPath, newPath string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if broken {
+				return errors.New("processing/ is read-only")
+			}
+			return os.Rename(oldPath, newPath)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sp.Close() })
+
+	first := write(t, sp.Dirs.Ingestions, NewName(time.Unix(100, 0), 1, 1), "aaaa\n")
+	second := write(t, sp.Dirs.Ingestions, NewName(time.Unix(200, 0), 2, 1), "bb\n")
+	sp.Ready(first)
+	sp.Ready(second)
+
+	if got := sp.BacklogBytes(); got != 8 {
+		t.Fatalf("stranded files must count as backlog: got %d bytes, want 8", got)
+	}
+	if got := sp.BacklogFiles(); got != 2 {
+		t.Fatalf("backlog files = %d, want 2", got)
+	}
+	time.Sleep(40 * time.Millisecond) // several failed retries
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("a stranded file must stay in ingestions/: %v", err)
+	}
+	if sp.Disp.BacklogFiles() != 0 {
+		t.Fatal("nothing can be queued while the move fails")
+	}
+
+	mu.Lock()
+	broken = false
+	mu.Unlock()
+
+	var got []string
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stranded files were never handed over, got %v", got)
+		}
+		got = append(got, drain(sp.Disp)...)
+	}
+	if got[0] != filepath.Base(first) || got[1] != filepath.Base(second) {
+		t.Fatalf("rotation order must be kept, got %v", got)
+	}
+	if n := sp.strandedBytes.Load(); n != 0 {
+		t.Fatalf("stranded bytes must return to 0, got %d", n)
+	}
+	if got := sp.BacklogBytes(); got != 8 {
+		t.Fatalf("the files are now queued and still backlog: got %d, want 8", got)
+	}
+}
+
+// A rotated file that vanished cannot be retried for ever.
+func TestSpool_ReadyDropsAFileThatIsGone(t *testing.T) {
+	sp := open(t)
+	sp.Ready(filepath.Join(sp.Dirs.Ingestions, NewName(time.Unix(1, 0), 1, 1)))
+	if sp.BacklogFiles() != 0 || sp.BacklogBytes() != 0 {
+		t.Fatal("a missing file must not be stranded")
+	}
+}
+
+func TestTimeOf(t *testing.T) {
+	when := time.Unix(1_700_000_000, 123)
+	got, ok := TimeOf(NewName(when, 7, 4242))
+	if !ok || !got.Equal(when) {
+		t.Fatalf("TimeOf(NewName(%v)) = %v, %v", when, got, ok)
+	}
+	for _, name := range []string{"", "notes.txt", "ingest_", "ingest_abc_1_1.list", "v1-file.list"} {
+		if _, ok := TimeOf(name); ok {
+			t.Errorf("TimeOf(%q) should not parse", name)
+		}
+	}
+}
+
+// backlog_oldest_seconds is derived from the oldest file still waiting,
+// whether it is queued or stranded in ingestions/.
+func TestSpool_OldestAge(t *testing.T) {
+	sp := open(t)
+	if age := sp.oldestAge(); age != 0 {
+		t.Fatalf("empty backlog: age %s, want 0", age)
+	}
+	recent := write(t, sp.Dirs.Processing, NewName(time.Now().Add(-time.Minute), 1, 1), "a\n")
+	old := write(t, sp.Dirs.Processing, NewName(time.Now().Add(-time.Hour), 2, 1), "b\n")
+	sp.Disp.Add(recent, 2)
+	sp.Disp.Add(old, 2)
+	if age := sp.oldestAge(); age < 59*time.Minute || age > 61*time.Minute {
+		t.Fatalf("age %s, want about an hour", age)
+	}
+	sp.Disp.Done(old)
+	if age := sp.oldestAge(); age < 59*time.Second || age > 2*time.Minute {
+		t.Fatalf("age %s, want about a minute", age)
+	}
+}
+
+// failed/ is measured, so it follows what the operator does to it by hand.
+func TestSpool_FailedBytes(t *testing.T) {
+	sp := open(t)
+	sp.failedEvery = 0 // no cache in this test
+	if got := sp.FailedBytes(); got != 0 {
+		t.Fatalf("empty failed/: %d", got)
+	}
+	bad := write(t, sp.Dirs.Failed, "a.list.bad", "1\tinvalid JSON\tnope\n")
+	write(t, sp.Dirs.Failed, "b.list", "0123456789")
+	if got := sp.FailedBytes(); got != 20+10 {
+		t.Fatalf("failed bytes = %d, want 30", got)
+	}
+	if err := os.Remove(bad); err != nil {
+		t.Fatal(err)
+	}
+	if got := sp.FailedBytes(); got != 10 {
+		t.Fatalf("after the operator removed a file: %d, want 10", got)
+	}
+
+	sp.failedEvery = time.Hour // cached: the directory is not read on every request
+	write(t, sp.Dirs.Failed, "c.list.bad", "xxxxx")
+	if got := sp.FailedBytes(); got != 10 {
+		t.Fatalf("within the cache window the value must not change, got %d", got)
+	}
+}

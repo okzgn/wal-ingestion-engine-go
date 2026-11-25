@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.26 AS build
+# Pinned to the minimum toolchain of go.mod: an older patch release would
+# refuse to build, a floating tag would build with whatever is cached.
+ARG GO_VERSION=1.26.11
+FROM golang:${GO_VERSION} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -19,7 +22,7 @@ ENV LISTEN_ADDR=:8080 \
 
 # The spool must survive restarts: mount a volume here.
 VOLUME /data
-EXPOSE 8080
+EXPOSE 8080 9090
 
 # SIGTERM starts the graceful shutdown, which takes up to SHUTDOWN_TIMEOUT
 # (15s by default): give the container a longer stop grace period than that

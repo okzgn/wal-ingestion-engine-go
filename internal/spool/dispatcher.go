@@ -2,6 +2,7 @@ package spool
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -114,6 +115,21 @@ func (d *Dispatcher) BacklogFiles() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.known)
+}
+
+// Oldest returns the creation time of the oldest file not yet fully
+// processed, taken from the file names. It reports false for an empty backlog.
+func (d *Dispatcher) Oldest() (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var oldest time.Time
+	found := false
+	for path := range d.known {
+		if t, ok := TimeOf(filepath.Base(path)); ok && (!found || t.Before(oldest)) {
+			oldest, found = t, true
+		}
+	}
+	return oldest, found
 }
 
 // Close wakes all waiters and drops pending retries. Files stay on disk in

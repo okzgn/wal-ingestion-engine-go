@@ -150,6 +150,15 @@ func FuzzLineReader(f *testing.F) {
 			if !tooLong && len(l) > max {
 				t.Fatalf("line of %d bytes exceeds max %d without tooLong", len(l), max)
 			}
+			// The reported position must hold the line: all of it, or its head
+			// when it was cut for being too long.
+			if lr.start < 0 || lr.start+lr.size > int64(len(in)) {
+				t.Fatalf("line located at %d+%d outside the %d-byte input", lr.start, lr.size, len(in))
+			}
+			whole := in[lr.start : lr.start+lr.size]
+			if !strings.HasPrefix(whole, string(l)) || (!tooLong && whole != string(l)) {
+				t.Fatalf("offsets %d+%d do not locate the line %q", lr.start, lr.size, l)
+			}
 			total += len(l)
 		}
 		if total > len(in) {
@@ -482,8 +491,12 @@ func TestRunner_RetriesPostponedFilesUntilTheSinkRecovers(t *testing.T) {
 	if len(fs.got()) != 2 {
 		t.Fatalf("delivered %v", fs.got())
 	}
-	if sp.Disp.BacklogFiles() != 0 {
-		t.Fatal("backlog must be empty")
+	// The file leaves the backlog right after it is removed, not atomically with it.
+	for sp.Disp.BacklogFiles() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("backlog must be empty")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	<-done
@@ -526,8 +539,7 @@ func TestRunner_GivesUpAfterMaxFileAttempts(t *testing.T) {
 }
 
 // Regression C3: one oversized line used to abort the whole file (and, when the
-// rename failed, truncate it to zero bytes). Its leading bytes are kept in the
-// dead letter instead of a 4 KiB preview.
+// rename failed, truncate it to zero bytes). It is dead-lettered whole.
 func TestLineReader_OversizeLineQuarantined(t *testing.T) {
 	e := newEnv(t, nil) // MaxLineSize = 1024
 	huge := `{"big":"` + strings.Repeat("x", 5000) + `"}`
@@ -543,8 +555,71 @@ func TestLineReader_OversizeLineQuarantined(t *testing.T) {
 	if len(rec) != 3 || rec[0] != "2" || !strings.Contains(rec[1], "maximum line size") {
 		t.Fatalf("dead letter = %q", bad)
 	}
-	if rec[2] != huge[:1024] {
-		t.Fatalf("the first MaxLineSize bytes must be kept, got %d bytes", len(rec[2]))
+	if rec[2] != huge {
+		t.Fatalf("the whole line must be kept, got %d of %d bytes", len(rec[2]), len(huge))
+	}
+}
+
+// Regression R9: a line longer than the reader's limit used to keep only its
+// first MaxLineSize bytes in the dead letter, and the data file was then
+// deleted: the rest of an acknowledged message was gone. It is now streamed
+// whole, whatever its size and wherever it sits in the file.
+func TestProcessor_OversizeLineIsDeadLetteredWhole(t *testing.T) {
+	e := newEnv(t, nil)                                             // MaxLineSize = 1024
+	first := `{"n":1,"pad":"` + strings.Repeat("a", 300_000) + `"}` // spans several read buffers
+	torn := `{"n":3,"pad":"` + strings.Repeat("b", 70_000)          // oversized and unterminated
+	p := e.writeFile(t, "o.list", first+"\n{\"i\":2}\n"+torn)
+	if err := e.proc.ProcessFile(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.sink.got(); len(got) != 1 || got[0] != `{"i":2}` {
+		t.Fatalf("the neighbour must be delivered, got %d messages", len(got))
+	}
+	bad, err := os.ReadFile(filepath.Join(e.failed, "o.list.bad"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := strings.Split(strings.TrimSuffix(string(bad), "\n"), "\n")
+	if len(recs) != 2 {
+		t.Fatalf("want 2 dead letters, got %d", len(recs))
+	}
+	for i, want := range []struct{ line, payload, reason string }{
+		{"1", first, fmt.Sprintf("line of %d bytes", len(first))},
+		{"3", torn, "torn write"},
+	} {
+		f := strings.SplitN(recs[i], "\t", 3)
+		if len(f) != 3 || f[0] != want.line || !strings.Contains(f[1], want.reason) {
+			t.Fatalf("dead letter %d: line=%q reason=%q", i, f[0], f[1])
+		}
+		if f[2] != want.payload {
+			t.Fatalf("dead letter %d holds %d of %d bytes", i, len(f[2]), len(want.payload))
+		}
+	}
+	if exists(p) {
+		t.Fatal("a fully handled file must be deleted")
+	}
+}
+
+// The offsets reported by the reader must locate each line exactly: they are
+// what the dead letter of an oversized line is copied from.
+func TestLineReader_ReportsWhereEachLineIs(t *testing.T) {
+	in := "a\n" + strings.Repeat("x", 100_000) + "\n\nlast"
+	lr := newLineReader(strings.NewReader(in), 10)
+	for {
+		_, _, _, err := lr.next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		got := in[lr.start : lr.start+lr.size]
+		if strings.Contains(got, "\n") {
+			t.Fatalf("line at %d+%d includes a terminator", lr.start, lr.size)
+		}
+		if end := lr.start + lr.size; end < int64(len(in)) && in[end] != '\n' {
+			t.Fatalf("line at %d+%d does not end at a terminator", lr.start, lr.size)
+		}
+	}
+	if lr.start != int64(len(in)) {
+		t.Fatalf("reader stopped at %d of %d bytes", lr.start, len(in))
 	}
 }
 
@@ -605,5 +680,79 @@ func TestProcessor_UnwritableDeadLetterKeepsFile(t *testing.T) {
 	}
 	if seen[`{"i":1}`] == 0 || seen[`{"i":3}`] == 0 {
 		t.Fatalf("valid neighbours must be delivered, got %v", e.sink.got())
+	}
+}
+
+// A processed file that could not be removed used to leave the backlog while
+// staying on disk until the next restart. Its removal is now retried, without
+// redelivering anything and without counting as a failed attempt (so it can
+// never be quarantined as if its messages had not been delivered).
+func TestRunner_RetriesRemovalWithoutRedelivery(t *testing.T) {
+	root := t.TempDir()
+	sp, err := spool.Open(root, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+
+	fs := &fakeSink{}
+	proc := NewProcessor(Options{Sink: fs, FailedDir: sp.Dirs.Failed, Logger: quiet})
+	path := filepath.Join(sp.Dirs.Processing, "r.list")
+	var mu sync.Mutex
+	failures := 3
+	proc.remove = func(p string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p == path && failures > 0 {
+			failures--
+			return errors.New("file is held by another process")
+		}
+		return os.Remove(p)
+	}
+	// MaxFileAttempts 1: a single counted failure would quarantine the file.
+	r := &Runner{Spool: sp, Proc: proc, Workers: 1, MaxFileAttempts: 1, RetryBase: time.Millisecond, RetryMax: 2 * time.Millisecond, Logger: quiet}
+
+	if err := os.WriteFile(path, []byte("{\"i\":1}\n{\"i\":2}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sp.Disp.Add(path, 16)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for exists(path) || sp.Disp.BacklogFiles() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the file was never removed")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := fs.got(); len(got) != 2 {
+		t.Fatalf("retrying the removal must not redeliver: got %v", got)
+	}
+	if exists(filepath.Join(sp.Dirs.Failed, "r.list")) {
+		t.Fatal("a delivered file must never be quarantined")
+	}
+	if exists(path + spool.CheckpointExt) {
+		t.Fatal("checkpoint left behind")
+	}
+}
+
+func TestProcessor_UnremovableFileIsCleanupPending(t *testing.T) {
+	e := newEnv(t, nil)
+	p := e.writeFile(t, "u.list", "{\"i\":1}\n")
+	e.proc.remove = func(string) error { return errors.New("busy") }
+	err := e.proc.ProcessFile(context.Background(), p)
+	if !errors.Is(err, ErrCleanupPending) || !errors.Is(err, ErrRetryLater) {
+		t.Fatalf("want ErrCleanupPending (a kind of ErrRetryLater), got %v", err)
+	}
+	ck, v, _ := OpenCheckpoint(p + spool.CheckpointExt)
+	ck.Close()
+	if v != 1 {
+		t.Fatalf("the checkpoint must cover the whole file, got %d", v)
 	}
 }

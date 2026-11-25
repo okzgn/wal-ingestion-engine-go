@@ -400,3 +400,30 @@ func TestHandler_InvalidJSONIsRefusedEvenWithFullBacklog(t *testing.T) {
 		t.Fatalf("whitespace-only body: status %d, want 400", code)
 	}
 }
+
+type fakeSpool struct{ backlog, failed int64 }
+
+func (f fakeSpool) BacklogBytes() int64 { return f.backlog }
+func (f fakeSpool) FailedBytes() int64  { return f.failed }
+
+// failed/ is emptied by nobody but the operator: with MAX_FAILED_BYTES a
+// stream of rejected messages sheds load instead of filling the disk.
+func TestHandler_FailedDirFullIs503(t *testing.T) {
+	w := &fakeAppender{}
+	cfg := Config{MaxMessageSize: 1 << 20, MaxFailedBytes: 100}
+	s := New(cfg, w, fakeSpool{failed: 101}, quiet)
+	code, body, hdr := post(t, s, `{"a":1}`, nil)
+	if code != 503 || !strings.Contains(body, "failed_full") || hdr.Get("Retry-After") == "" {
+		t.Fatalf("status %d (%s), want 503 failed_full with Retry-After", code, body)
+	}
+	if len(w.got()) != 0 {
+		t.Fatal("message accepted although failed/ is over its limit")
+	}
+	if code, _, _ := post(t, New(cfg, w, fakeSpool{failed: 100}, quiet), `{"a":1}`, nil); code != 200 {
+		t.Fatalf("at the limit: status %d, want 200", code)
+	}
+	cfg.MaxFailedBytes = 0
+	if code, _, _ := post(t, New(cfg, w, fakeSpool{failed: 1 << 40}, quiet), `{"a":1}`, nil); code != 200 {
+		t.Fatalf("0 disables the limit: status %d, want 200", code)
+	}
+}

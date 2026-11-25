@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -17,6 +18,17 @@ import (
 	"strings"
 	"time"
 )
+
+// MaxMessageSizeLimit is the ceiling of MAX_MESSAGE_SIZE. It equals the longest
+// line the file reader delivers (pipeline.DefaultMaxLineSize), so a message can
+// never be acknowledged and then turn out too long to be delivered, not even by
+// a later run started with a lower limit.
+const MaxMessageSizeLimit = 16 << 20
+
+// MaxSinkConcurrency caps SINK_CONCURRENCY. Every message in delivery is held
+// in memory, and WORKERS x SINK_CONCURRENCY requests hit the destination at
+// once: past this point a faster destination helps, more concurrency does not.
+const MaxSinkConcurrency = 64
 
 // Config holds every tunable of the engine.
 type Config struct {
@@ -33,8 +45,11 @@ type Config struct {
 	QueueSize        int
 	MaxInflightBytes int64
 	MaxBacklogBytes  int64
+	MaxBodyMemory    int64
+	MaxFailedBytes   int64
 
 	Workers               int
+	SinkConcurrency       int
 	CheckpointInterval    int
 	SinkURL               string
 	SinkTimeout           time.Duration
@@ -44,11 +59,14 @@ type Config struct {
 	SinkAuthorization     string
 	SinkHeaders           http.Header
 	SinkPermanentStatuses []int
+	SinkKeyJSONPointer    string
 	FileRetryBase         time.Duration
 	FileRetryMax          time.Duration
 	MaxFileAttempts       int
+	MaxLineAttempts       int
 
 	WebhookSecret          string
+	WebhookSignatureScheme string
 	WebhookSignatureHeader string
 	WebhookTimestampHeader string
 	WebhookTolerance       time.Duration
@@ -89,8 +107,11 @@ func settings(c *Config) []setting {
 		{"QUEUE_SIZE", "queue-size", "4096", "capacity of the writer queue", num(&c.QueueSize)},
 		{"MAX_INFLIGHT_BYTES", "max-inflight-bytes", "64MiB", "503 above this many bytes waiting for the disk", size(&c.MaxInflightBytes)},
 		{"MAX_BACKLOG_BYTES", "max-backlog-bytes", "1GiB", "503 above this much unprocessed data on disk", size(&c.MaxBacklogBytes)},
+		{"MAX_FAILED_BYTES", "max-failed-bytes", "0", "503 while failed/ holds more than this (0 = no limit)", size(&c.MaxFailedBytes)},
+		{"MAX_BODY_MEMORY", "max-body-memory", "256MiB", "503 above this many bytes of request bodies in memory at once (0 = no limit)", size(&c.MaxBodyMemory)},
 
-		{"WORKERS", "workers", "4", "concurrent file workers (1 = in-order delivery)", num(&c.Workers)},
+		{"WORKERS", "workers", "4", "files processed at the same time", num(&c.Workers)},
+		{"SINK_CONCURRENCY", "sink-concurrency", "8", "messages of one file in delivery at the same time (WORKERS=1 with 1 here = in-order delivery)", num(&c.SinkConcurrency)},
 		{"CHECKPOINT_INTERVAL", "checkpoint-interval", "50", "lines between checkpoint saves", num(&c.CheckpointInterval)},
 		{"SINK_URL", "sink-url", "", "forward every message to this URL (empty = discard)", str(&c.SinkURL)},
 		{"SINK_TIMEOUT", "sink-timeout", "10s", "timeout of one delivery request", dur(&c.SinkTimeout)},
@@ -99,14 +120,17 @@ func settings(c *Config) []setting {
 		{"SINK_BACKOFF_MAX", "sink-backoff-max", "30s", "per-message retry delay cap", dur(&c.SinkBackoffMax)},
 		{"SINK_AUTHORIZATION", "", "", "Authorization header sent with every delivery, e.g. 'Bearer <token>'", str(&c.SinkAuthorization)},
 		{"SINK_HEADERS", "", "", "extra delivery headers: 'Name: value, Name2: value2'", headers(&c.SinkHeaders)},
+		{"SINK_KEY_JSON_POINTER", "sink-key-json-pointer", "", "JSON Pointer (e.g. /id) to the sender's message id; its value becomes the Idempotency-Key (empty = <file>:<line>)", str(&c.SinkKeyJSONPointer)},
 		{"SINK_PERMANENT_STATUSES", "sink-permanent-statuses", "400,413,415,422", "destination statuses that dead-letter a message instead of retrying it", ints(&c.SinkPermanentStatuses)},
 		{"FILE_RETRY_BASE", "file-retry-base", "1s", "first delay before a postponed file is retried", dur(&c.FileRetryBase)},
 		{"FILE_RETRY_MAX", "file-retry-max", "1m", "postponed file retry delay cap", dur(&c.FileRetryMax)},
-		{"MAX_FILE_ATTEMPTS", "max-file-attempts", "0", "move a file to failed/ after this many postponements (0 = never)", num(&c.MaxFileAttempts)},
+		{"MAX_FILE_ATTEMPTS", "max-file-attempts", "0", "move a file to failed/ after it is postponed this many times on the same message (0 = never)", num(&c.MaxFileAttempts)},
+		{"MAX_LINE_ATTEMPTS", "max-line-attempts", "10", "dead-letter a message after it stalls its file this many times while the destination accepts others (0 = never)", num(&c.MaxLineAttempts)},
 
 		{"WEBHOOK_SECRET", "", "", "HMAC-SHA256 secret; enables signature verification", str(&c.WebhookSecret)},
-		{"WEBHOOK_SIGNATURE_HEADER", "webhook-signature-header", "X-Signature-256", "header carrying sha256=<hex>", str(&c.WebhookSignatureHeader)},
-		{"WEBHOOK_TIMESTAMP_HEADER", "webhook-timestamp-header", "", "header carrying unix seconds; enables the anti-replay check", str(&c.WebhookTimestampHeader)},
+		{"WEBHOOK_SIGNATURE_SCHEME", "webhook-signature-scheme", "generic", "how the sender signs: generic, github, stripe or slack", str(&c.WebhookSignatureScheme)},
+		{"WEBHOOK_SIGNATURE_HEADER", "webhook-signature-header", "", "signature header (empty = the scheme's own; X-Signature-256 for generic)", str(&c.WebhookSignatureHeader)},
+		{"WEBHOOK_TIMESTAMP_HEADER", "webhook-timestamp-header", "", "generic scheme: header carrying unix seconds, enables the anti-replay check; slack: overrides X-Slack-Request-Timestamp", str(&c.WebhookTimestampHeader)},
 		{"WEBHOOK_TOLERANCE", "webhook-tolerance", "5m", "accepted clock skew for the timestamp", dur(&c.WebhookTolerance)},
 		{"RATE_LIMIT_PER_MINUTE", "rate-limit-per-minute", "0", "per-client request limit (0 = off)", num(&c.RateLimitPerMinute)},
 		{"TRUSTED_PROXIES", "trusted-proxies", "", "IPs or CIDRs of reverse proxies whose PROXY_HEADER gives the client IP (empty = the TCP peer is the client)", list(&c.TrustedProxies)},
@@ -144,7 +168,7 @@ func Load(args []string, lookup func(string) (string, bool)) (*Config, error) {
 			return nil, fmt.Errorf("%s: %w", s.env, err)
 		}
 		if s.flag != "" {
-			fs.String(s.flag, v, s.usage+" [$"+s.env+"]")
+			fs.Var(&flagValue{value: v, isBool: boolSettings[s.env]}, s.flag, s.usage+" [$"+s.env+"]")
 		}
 	}
 	if err := fs.Parse(args); err != nil {
@@ -171,6 +195,23 @@ func Load(args []string, lookup func(string) (string, bool)) (*Config, error) {
 	}
 	return c, nil
 }
+
+// boolSettings are the on/off settings: their flag works without a value
+// ("-admin-pprof"), like every boolean flag of the standard library.
+var boolSettings = map[string]bool{"ADMIN_PPROF": true}
+
+// flagValue holds a flag as text until the setting parses it, so a flag and
+// its environment variable go through exactly the same parser.
+type flagValue struct {
+	value  string
+	isBool bool
+}
+
+func (f *flagValue) String() string     { return f.value }
+func (f *flagValue) Set(v string) error { f.value = v; return nil }
+
+// IsBoolFlag lets the flag package accept the flag without a value.
+func (f *flagValue) IsBoolFlag() bool { return f.isBool }
 
 // Usage describes every setting, for -h output and the README.
 func Usage() string {
@@ -202,6 +243,9 @@ func (c *Config) Validate() error {
 	if c.MaxMessageSize < 1024 {
 		bad("MAX_MESSAGE_SIZE must be at least 1KiB")
 	}
+	if c.MaxMessageSize > MaxMessageSizeLimit {
+		bad("MAX_MESSAGE_SIZE must not exceed 16MiB: a larger message would be acknowledged and then be too long to deliver")
+	}
 	if c.MaxFileSize < 1 {
 		bad("MAX_FILE_SIZE must be positive")
 	}
@@ -226,8 +270,14 @@ func (c *Config) Validate() error {
 	if c.MaxBacklogBytes < 0 {
 		bad("MAX_BACKLOG_BYTES must not be negative (0 disables the limit)")
 	}
+	if c.MaxBodyMemory != 0 && c.MaxBodyMemory < c.MaxMessageSize {
+		bad("MAX_BODY_MEMORY must be at least MAX_MESSAGE_SIZE, or the largest message could never be accepted (0 disables the limit)")
+	}
 	if c.Workers < 1 {
 		bad("WORKERS must be at least 1")
+	}
+	if c.SinkConcurrency < 1 || c.SinkConcurrency > MaxSinkConcurrency {
+		bad("SINK_CONCURRENCY must be between 1 and %d", MaxSinkConcurrency)
 	}
 	if c.CheckpointInterval < 1 {
 		bad("CHECKPOINT_INTERVAL must be at least 1")
@@ -239,6 +289,17 @@ func (c *Config) Validate() error {
 			bad("SINK_URL must be an http(s) URL, got %q", c.SinkURL)
 		case u.User != nil:
 			bad("SINK_URL must not carry credentials (they would show up in logs); use SINK_AUTHORIZATION")
+		}
+	}
+	if p := c.SinkKeyJSONPointer; p != "" {
+		ok := strings.HasPrefix(p, "/")
+		for i := 0; ok && i < len(p); i++ {
+			if p[i] == '~' && (i+1 >= len(p) || (p[i+1] != '0' && p[i+1] != '1')) {
+				ok = false
+			}
+		}
+		if !ok {
+			bad("SINK_KEY_JSON_POINTER must be a JSON Pointer such as /id or /data/object/id, got %q", p)
 		}
 	}
 	if c.SinkTimeout <= 0 {
@@ -261,8 +322,20 @@ func (c *Config) Validate() error {
 	if c.MaxFileAttempts < 0 {
 		bad("MAX_FILE_ATTEMPTS must not be negative")
 	}
-	if c.WebhookSignatureHeader == "" {
-		bad("WEBHOOK_SIGNATURE_HEADER must not be empty")
+	if c.MaxLineAttempts < 0 {
+		bad("MAX_LINE_ATTEMPTS must not be negative (0 never gives up on a message)")
+	}
+	switch scheme := strings.ToLower(c.WebhookSignatureScheme); scheme {
+	case "generic", "slack":
+	case "github", "stripe":
+		if c.WebhookTimestampHeader != "" {
+			bad("WEBHOOK_TIMESTAMP_HEADER does not apply to the %s scheme", scheme)
+		}
+	default:
+		bad("WEBHOOK_SIGNATURE_SCHEME must be generic, github, stripe or slack, got %q", c.WebhookSignatureScheme)
+	}
+	if c.WebhookSignatureScheme != "" && !strings.EqualFold(c.WebhookSignatureScheme, "generic") && c.WebhookSecret == "" {
+		bad("WEBHOOK_SIGNATURE_SCHEME requires WEBHOOK_SECRET")
 	}
 	if c.WebhookTimestampHeader != "" && c.WebhookSecret == "" {
 		bad("WEBHOOK_TIMESTAMP_HEADER requires WEBHOOK_SECRET")
@@ -407,8 +480,8 @@ func splitList(v string) []string {
 }
 
 // ParseHeaders parses "Name: value, Name2: value2". Headers are separated by
-// commas or newlines, so a value cannot contain a comma. Idempotency-Key is
-// reserved: the engine sets it on every delivery.
+// commas or newlines, so a value cannot contain a comma. Idempotency-Key and
+// X-Delivery-Id are reserved: the engine sets them on every delivery.
 func ParseHeaders(s string) (http.Header, error) {
 	h := http.Header{}
 	for _, item := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' }) {
@@ -421,8 +494,10 @@ func ParseHeaders(s string) (http.Header, error) {
 		if !ok || !validHeaderName(name) {
 			return nil, fmt.Errorf("header %q is not of the form \"Name: value\"", item)
 		}
-		if strings.EqualFold(name, "Idempotency-Key") {
-			return nil, errors.New("header Idempotency-Key is set by the engine and cannot be overridden")
+		for _, reserved := range []string{"Idempotency-Key", "X-Delivery-Id"} {
+			if strings.EqualFold(name, reserved) {
+				return nil, fmt.Errorf("header %s is set by the engine and cannot be overridden", reserved)
+			}
 		}
 		h.Add(name, value)
 	}
@@ -465,6 +540,9 @@ func ParseSize(s string) (int64, error) {
 	n, err := strconv.ParseInt(t, 10, 64)
 	if err != nil || n < 0 {
 		return 0, fmt.Errorf("not a size (e.g. 512KiB, 1MiB, 64MB): %q", s)
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size too large: %q", s)
 	}
 	return n * mult, nil
 }

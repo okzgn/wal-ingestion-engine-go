@@ -17,7 +17,7 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.ListenAddr != ":8080" || c.DataDir != "./data" || c.MaxMessageSize != 1<<20 ||
-		c.Workers != 4 || c.AckTimeout != 5*time.Second || c.AdminAddr != "127.0.0.1:9090" {
+		c.Workers != 4 || c.SinkConcurrency != 8 || c.AckTimeout != 5*time.Second || c.AdminAddr != "127.0.0.1:9090" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if c.WebhookSecret != "" || c.SinkURL != "" || c.SinkAuthorization != "" || len(c.TrustedProxies) != 0 {
@@ -126,20 +126,30 @@ func TestLoad_Errors(t *testing.T) {
 		{"bad size", nil, map[string]string{"MAX_FILE_SIZE": "huge"}, "MAX_FILE_SIZE"},
 		{"bad bool", nil, map[string]string{"ADMIN_PPROF": "maybe"}, "ADMIN_PPROF"},
 		{"zero workers", nil, map[string]string{"WORKERS": "0"}, "WORKERS must be at least 1"},
+		{"zero sink concurrency", nil, map[string]string{"SINK_CONCURRENCY": "0"}, "SINK_CONCURRENCY"},
+		{"huge sink concurrency", nil, map[string]string{"SINK_CONCURRENCY": "65"}, "SINK_CONCURRENCY"},
 		{"tiny message limit", nil, map[string]string{"MAX_MESSAGE_SIZE": "10"}, "MAX_MESSAGE_SIZE"},
+		// R9: above the reader's line limit a message was acknowledged and then truncated.
+		{"message limit above the reader's", nil, map[string]string{"MAX_MESSAGE_SIZE": "32MiB", "MAX_BATCH_BYTES": "32MiB"}, "MAX_MESSAGE_SIZE must not exceed 16MiB"},
 		{"write <= ack", nil, map[string]string{"WRITE_TIMEOUT": "5s", "ACK_TIMEOUT": "5s"}, "WRITE_TIMEOUT"},
 		{"inflight below message", nil, map[string]string{"MAX_INFLIGHT_BYTES": "1KiB"}, "MAX_INFLIGHT_BYTES"},
 		{"batch below message", nil, map[string]string{"MAX_BATCH_BYTES": "1KiB"}, "MAX_BATCH_BYTES"},
+		{"body memory below message", nil, map[string]string{"MAX_BODY_MEMORY": "1KiB"}, "MAX_BODY_MEMORY"},
 		{"bad sink url", nil, map[string]string{"SINK_URL": "ftp://x"}, "SINK_URL"},
 		{"credentials in sink url", nil, map[string]string{"SINK_URL": "https://user:pass@x.example/e"}, "SINK_AUTHORIZATION"},
 		{"bad sink header", nil, map[string]string{"SINK_HEADERS": "no colon"}, "SINK_HEADERS"},
 		{"invalid header name", nil, map[string]string{"SINK_HEADERS": "Bad Name: v"}, "SINK_HEADERS"},
 		{"reserved header", nil, map[string]string{"SINK_HEADERS": "idempotency-key: v"}, "Idempotency-Key"},
+		{"bad key pointer", nil, map[string]string{"SINK_KEY_JSON_POINTER": "id"}, "SINK_KEY_JSON_POINTER"},
+		{"bad key pointer escape", nil, map[string]string{"SINK_KEY_JSON_POINTER": "/a~2b"}, "SINK_KEY_JSON_POINTER"},
 		{"bad permanent status", nil, map[string]string{"SINK_PERMANENT_STATUSES": "200"}, "SINK_PERMANENT_STATUSES"},
 		{"non-numeric status", nil, map[string]string{"SINK_PERMANENT_STATUSES": "4xx"}, "SINK_PERMANENT_STATUSES"},
 		{"bad trusted proxy", nil, map[string]string{"TRUSTED_PROXIES": "proxy.internal"}, "TRUSTED_PROXIES"},
 		{"proxies without header", nil, map[string]string{"TRUSTED_PROXIES": "10.0.0.1", "PROXY_HEADER": ""}, "PROXY_HEADER"},
 		{"timestamp without secret", nil, map[string]string{"WEBHOOK_TIMESTAMP_HEADER": "X-T"}, "WEBHOOK_SECRET"},
+		{"unknown signature scheme", nil, map[string]string{"WEBHOOK_SECRET": "s", "WEBHOOK_SIGNATURE_SCHEME": "paypal"}, "WEBHOOK_SIGNATURE_SCHEME"},
+		{"scheme without secret", nil, map[string]string{"WEBHOOK_SIGNATURE_SCHEME": "stripe"}, "WEBHOOK_SECRET"},
+		{"timestamp header with stripe", nil, map[string]string{"WEBHOOK_SECRET": "s", "WEBHOOK_SIGNATURE_SCHEME": "stripe", "WEBHOOK_TIMESTAMP_HEADER": "X-T"}, "does not apply"},
 		{"zero idle timeout", nil, map[string]string{"IDLE_TIMEOUT": "0s"}, "IDLE_TIMEOUT"},
 		{"bad log level", nil, map[string]string{"LOG_LEVEL": "loud"}, "LOG_LEVEL"},
 		{"unknown flag", []string{"-nope"}, nil, "flags"},
@@ -176,9 +186,41 @@ func TestParseSize(t *testing.T) {
 			t.Errorf("ParseSize(%q) = %d, %v; want %d", in, got, err, want)
 		}
 	}
+	if got, err := ParseSize("8589934591GiB"); err != nil || got != 8589934591<<30 {
+		t.Errorf("the largest size that fits must parse: %d, %v", got, err)
+	}
+	// An overflow used to wrap around silently, sometimes into a positive size.
+	for _, in := range []string{"8589934592GiB", "99999999999GiB", "9223372036854775807KB"} {
+		if _, err := ParseSize(in); err == nil || !strings.Contains(err.Error(), "too large") {
+			t.Errorf("ParseSize(%q) must report an overflow, got %v", in, err)
+		}
+	}
 	for _, in := range []string{"", "x", "-1", "1.5MiB", "MiB", "1TB"} {
 		if _, err := ParseSize(in); err == nil {
 			t.Errorf("ParseSize(%q) should fail", in)
+		}
+	}
+}
+
+// "-admin-pprof" used to fail with "flag needs an argument".
+func TestLoad_BooleanFlagNeedsNoValue(t *testing.T) {
+	for args, want := range map[string]bool{
+		"-admin-pprof":       true,
+		"-admin-pprof=true":  true,
+		"-admin-pprof=false": false,
+	} {
+		c, err := Load([]string{args}, env(map[string]string{"ADMIN_PPROF": "false"}))
+		if err != nil || c.AdminPprof != want {
+			t.Errorf("%s: AdminPprof=%v err=%v, want %v", args, c.AdminPprof, err, want)
+		}
+	}
+	if _, err := Load([]string{"-admin-pprof=maybe"}, env(nil)); err == nil {
+		t.Error("a bad boolean must still be rejected")
+	}
+	// Every setting with a true/false default must be registered as boolean.
+	for _, s := range settings(&Config{}) {
+		if (s.def == "true" || s.def == "false") != boolSettings[s.env] {
+			t.Errorf("%s: default %q but boolSettings says %v", s.env, s.def, boolSettings[s.env])
 		}
 	}
 }

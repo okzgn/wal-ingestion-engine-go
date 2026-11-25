@@ -22,11 +22,12 @@ func RemoveWithRetry(path string, attempts int) error {
 }
 
 // RenameWithRetry renames oldPath to newPath with the same retry policy as
-// RemoveWithRetry.
+// RemoveWithRetry. On Windows the rename is written through to disk; on Unix
+// the caller makes it durable with SyncDir.
 func RenameWithRetry(oldPath, newPath string, attempts int) error {
 	var err error
 	for i := 1; i <= attempts; i++ {
-		err = os.Rename(oldPath, newPath)
+		err = rename(oldPath, newPath)
 		if err == nil {
 			return nil
 		}

@@ -19,12 +19,19 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
 
 var binPath string
+
+// client keeps its connections alive. The default client keeps two per host:
+// under load every other request opens a new socket, and on Windows a few
+// thousand of them in TIME_WAIT exhaust the ephemeral ports.
+var client = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 30 * time.Second},
+}
 
 func TestMain(m *testing.M) {
 	flag.Parse()
@@ -127,13 +134,22 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-func freeAddr(t *testing.T) string {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+// freeAddrs returns two distinct free addresses. Both listeners are held open
+// until both are known: asking for one port, releasing it and asking again can
+// return the same port twice.
+func freeAddrs(t *testing.T) (string, string) {
+	t.Helper()
+	a, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	return l.Addr().String()
+	defer a.Close()
+	b, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	return a.Addr().String(), b.Addr().String()
 }
 
 func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
@@ -141,7 +157,8 @@ func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
 	if testing.Short() {
 		t.Skip("e2e skipped with -short")
 	}
-	in := &instance{t: t, addr: freeAddr(t), admin: freeAddr(t), stderr: &syncBuffer{}, done: make(chan struct{})}
+	addr, admin := freeAddrs(t)
+	in := &instance{t: t, addr: addr, admin: admin, stderr: &syncBuffer{}, done: make(chan struct{})}
 	in.cmd = exec.Command(binPath)
 	in.cmd.Env = append(os.Environ(),
 		"LISTEN_ADDR="+in.addr,
@@ -158,6 +175,7 @@ func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
 	)
 	in.cmd.Env = append(in.cmd.Env, extra...)
 	in.cmd.Stderr = in.stderr
+	prepare(in.cmd)
 	if err := in.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -171,11 +189,11 @@ func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
 			t.Fatalf("process exited during startup: %v\n%s", in.exit, in.stderr.String())
 		default:
 		}
-		if resp, err := http.Get("http://" + in.admin + "/readyz"); err == nil {
+		if resp, err := client.Get("http://" + in.admin + "/readyz"); err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				// readyz comes up before the HTTP listener on a busy machine: check both.
-				if r2, err := http.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader("{}")); err == nil {
+				if r2, err := client.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader("{}")); err == nil {
 					r2.Body.Close()
 					return in
 				}
@@ -195,7 +213,7 @@ func (in *instance) kill() {
 }
 
 func (in *instance) post(body string) (int, string) {
-	resp, err := http.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader(body))
+	resp, err := client.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader(body))
 	if err != nil {
 		return -1, err.Error()
 	}
@@ -354,10 +372,11 @@ func TestE2E_CrashRecovery(t *testing.T) {
 	if lost != 0 {
 		t.Fatalf("%d acknowledged messages were lost", lost)
 	}
-	// At-least-once: duplicates are allowed but bounded by the checkpoint interval
-	// of the files that were in flight at the crash (4 workers x 50 lines).
-	if dups > 4*50 {
-		t.Errorf("%d duplicates exceed the bound of 200", dups)
+	// At-least-once: duplicates are allowed but bounded, per file in flight at
+	// the crash, by the checkpoint interval plus the delivery window:
+	// 4 workers x (50 lines + 8 concurrent deliveries).
+	if bound := 4 * (50 + 8); dups > bound {
+		t.Errorf("%d duplicates exceed the bound of %d", dups, bound)
 	}
 	in3.kill()
 }
@@ -369,8 +388,9 @@ func TestE2E_SecondInstanceIsRefused(t *testing.T) {
 	first := start(t, dir, ds.srv.URL)
 	_ = first
 
+	addr, admin := freeAddrs(t)
 	cmd := exec.Command(binPath)
-	cmd.Env = append(os.Environ(), "LISTEN_ADDR="+freeAddr(t), "ADMIN_ADDR="+freeAddr(t), "DATA_DIR="+dir)
+	cmd.Env = append(os.Environ(), "LISTEN_ADDR="+addr, "ADMIN_ADDR="+admin, "DATA_DIR="+dir)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatal("the second instance must refuse to start")
@@ -396,11 +416,9 @@ func TestE2E_InvalidConfigFailsFast(t *testing.T) {
 	}
 }
 
-// SIGTERM under load: clean exit, and a restart finds everything acknowledged.
+// A shutdown request under load (SIGTERM; CTRL_BREAK on Windows): clean exit,
+// and a restart finds everything acknowledged.
 func TestE2E_GracefulShutdown(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Go cannot deliver SIGTERM to a child on Windows")
-	}
 	ds := newDownstream(t)
 	dir := t.TempDir()
 	in := start(t, dir, ds.srv.URL, "SHUTDOWN_TIMEOUT=10s")
@@ -412,7 +430,12 @@ func TestE2E_GracefulShutdown(t *testing.T) {
 	go func() { defer wg.Done(); acked = in.sendMany("g", 100000, 16, stop) }()
 	time.Sleep(700 * time.Millisecond)
 
-	if err := in.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := interrupt(in.cmd); err != nil {
+		close(stop)
+		wg.Wait()
+		if runtime.GOOS == "windows" {
+			t.Skipf("cannot send a console control event here (no console?): %v", err)
+		}
 		t.Fatal(err)
 	}
 	select {

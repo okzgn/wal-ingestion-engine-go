@@ -9,10 +9,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -33,6 +36,12 @@ type Backlog interface {
 	BacklogBytes() int64
 }
 
+// deadLetterSizer is implemented by a Backlog that can also tell how much the
+// dead-letter directory holds (the spool does).
+type deadLetterSizer interface {
+	FailedBytes() int64
+}
+
 // Config configures the HTTP server.
 type Config struct {
 	Endpoint           string
@@ -45,6 +54,19 @@ type Config struct {
 	MaxBacklogBytes    int64
 	RateLimitPerMinute int
 
+	// MaxFailedBytes sheds load (503) while the dead-letter directory holds
+	// more than this (0 = no limit). Nothing empties that directory but the
+	// operator: without a limit a stream of rejected messages fills the disk,
+	// and a full disk stops everything, not only the rejected ones.
+	MaxFailedBytes int64
+
+	// MaxBodyMemory bounds the request bodies held in memory at once, across
+	// every connection (0 = no bound). Bodies are read by the handler, after
+	// this much has been reserved for them, instead of by the server before
+	// the handler runs: without it MaxConnections x MaxMessageSize bytes could
+	// be buffered before a single signature is checked.
+	MaxBodyMemory int64
+
 	// TrustedProxies lists the reverse proxies (IPs or CIDRs) whose ProxyHeader
 	// is believed for the client IP that the rate limit keys on. Without it
 	// every request behind a proxy shares the proxy's IP and the per-client
@@ -52,10 +74,14 @@ type Config struct {
 	TrustedProxies []string
 	ProxyHeader    string // default X-Forwarded-For
 
-	// HMAC verification is enabled when Secret is not empty.
-	Secret          string
+	// Signature verification is enabled when Secret is not empty.
+	Secret string
+	// SignatureScheme is how the sender signs (default SchemeGeneric).
+	SignatureScheme Scheme
+	// SignatureHeader and TimestampHeader override the headers of the scheme.
+	// With the generic scheme a TimestampHeader enables the anti-replay check.
 	SignatureHeader string
-	TimestampHeader string // optional: enables the anti-replay check
+	TimestampHeader string
 	Tolerance       time.Duration
 }
 
@@ -65,9 +91,11 @@ type Server struct {
 	app     *fiber.App
 	w       Appender
 	backlog Backlog
+	dead    deadLetterSizer // nil when the backlog cannot report it
 	ver     *Verifier
 	log     *slog.Logger
 	pool    sync.Pool
+	bodyMem atomic.Int64 // bytes reserved for request bodies being handled
 
 	// Both lines can repeat thousands of times per second while the disk is
 	// failing; they are throttled so the log keeps the signal, not the flood.
@@ -89,9 +117,11 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 	if cfg.AckTimeout <= 0 {
 		cfg.AckTimeout = 5 * time.Second
 	}
-	if cfg.SignatureHeader == "" {
-		cfg.SignatureHeader = "X-Signature-256"
+	if cfg.SignatureScheme == "" {
+		cfg.SignatureScheme = SchemeGeneric
 	}
+	cfg.SignatureScheme = Scheme(strings.ToLower(string(cfg.SignatureScheme)))
+	cfg.SignatureHeader, cfg.TimestampHeader = SchemeHeaders(cfg.SignatureScheme, cfg.SignatureHeader, cfg.TimestampHeader)
 	if cfg.ProxyHeader == "" {
 		cfg.ProxyHeader = fiber.HeaderXForwardedFor
 	}
@@ -102,18 +132,25 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 		failed:       logutil.NewThrottle(time.Second),
 	}
 	s.pool.New = func() any { return new(bytes.Buffer) }
+	if d, ok := backlog.(deadLetterSizer); ok {
+		s.dead = d
+	}
 	if cfg.Secret != "" {
-		s.ver = NewVerifier(cfg.Secret, cfg.TimestampHeader != "", cfg.Tolerance)
+		s.ver = NewSchemeVerifier(cfg.SignatureScheme, cfg.Secret, cfg.TimestampHeader != "", cfg.Tolerance)
 	}
 
 	fcfg := fiber.Config{
-		AppName:      "WAL Ingestion Engine",
-		BodyLimit:    cfg.MaxMessageSize,
-		Concurrency:  cfg.MaxConnections,
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
-		IdleTimeout:  cfg.IdleTimeout,
-		ErrorHandler: s.errorHandler,
+		AppName:   "WAL Ingestion Engine",
+		BodyLimit: cfg.MaxMessageSize,
+		// The handler reads the body itself (see readBody): the server only
+		// pre-reads the first few KiB, so a connection costs almost nothing
+		// until its body has been admitted against MaxBodyMemory.
+		StreamRequestBody: true,
+		Concurrency:       cfg.MaxConnections,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
+		ErrorHandler:      s.errorHandler,
 	}
 	if len(cfg.TrustedProxies) > 0 {
 		fcfg.TrustProxy = true
@@ -161,7 +198,12 @@ func (s *Server) webhook(c fiber.Ctx) error {
 		return s.reject(c, fiber.StatusUnsupportedMediaType, "unsupported_encoding", "Content-Encoding is not supported")
 	}
 
-	body := c.Body()
+	raw, done, ok := s.readBody(c)
+	if !ok {
+		return nil // already answered
+	}
+	defer done()
+	body := raw.Bytes()
 	if len(body) == 0 {
 		return s.reject(c, fiber.StatusBadRequest, "empty_body", "empty body")
 	}
@@ -184,6 +226,10 @@ func (s *Server) webhook(c fiber.Ctx) error {
 	if s.backlog != nil && s.cfg.MaxBacklogBytes > 0 && s.backlog.BacklogBytes() > s.cfg.MaxBacklogBytes {
 		s.release(buf)
 		return s.unavailable(c, "backlog_full", "the processing backlog is full")
+	}
+	if s.dead != nil && s.cfg.MaxFailedBytes > 0 && s.dead.FailedBytes() > s.cfg.MaxFailedBytes {
+		s.release(buf)
+		return s.unavailable(c, "failed_full", "the dead-letter directory is full")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.AckTimeout)
@@ -217,6 +263,72 @@ func (s *Server) webhook(c fiber.Ctx) error {
 		return s.unavailable(c, "unavailable", "storage is unavailable")
 	}
 }
+
+// readBody admits the request body against the memory budget and reads it. On
+// success the caller must call done when it no longer needs the buffer. When
+// ok is false the request has already been answered.
+//
+// The connection is closed after any refusal, since part of the body may still
+// be on the wire. A bounded amount of it is read and thrown away first
+// (maxDrain, held nowhere): a client that is still sending when the connection
+// closes sees a reset instead of the answer.
+func (s *Server) readBody(c fiber.Ctx) (body *bytes.Buffer, done func(), ok bool) {
+	limit := s.cfg.MaxMessageSize
+	refuse := func(error) (*bytes.Buffer, func(), bool) {
+		c.Response().SetConnectionClose()
+		if stream := c.Request().BodyStream(); stream != nil {
+			_, _ = io.CopyN(io.Discard, stream, maxDrain)
+		}
+		return nil, nil, false
+	}
+
+	// -1 is a chunked body of unknown length: it may grow up to the limit.
+	declared := c.Request().Header.ContentLength()
+	if declared > limit {
+		return refuse(s.reject(c, fiber.StatusRequestEntityTooLarge, "too_large", "Request Entity Too Large"))
+	}
+	reserve := int64(limit)
+	if declared >= 0 {
+		reserve = int64(declared)
+	}
+	if s.cfg.MaxBodyMemory > 0 && s.bodyMem.Add(reserve) > s.cfg.MaxBodyMemory {
+		s.bodyMem.Add(-reserve)
+		return refuse(s.unavailable(c, "body_memory_full", "too many request bodies in memory"))
+	}
+	buf := s.pool.Get().(*bytes.Buffer)
+	buf.Reset()
+	done = func() {
+		s.release(buf)
+		if s.cfg.MaxBodyMemory > 0 {
+			s.bodyMem.Add(-reserve)
+		}
+	}
+
+	if stream := c.Request().BodyStream(); stream != nil {
+		if declared > 0 {
+			buf.Grow(declared)
+		}
+		// One byte past the limit is enough to know a chunked body is too big.
+		_, rerr := buf.ReadFrom(io.LimitReader(stream, int64(limit)+1))
+		if rerr != nil {
+			done()
+			return refuse(s.reject(c, fiber.StatusBadRequest, "bad_body", "the request body could not be read"))
+		}
+	} else {
+		buf.Write(c.Request().Body()) // not streamed: the server already holds it
+	}
+	if buf.Len() > limit {
+		done()
+		return refuse(s.reject(c, fiber.StatusRequestEntityTooLarge, "too_large", "Request Entity Too Large"))
+	}
+	return buf, done, true
+}
+
+// maxDrain is how much of a refused body is read and discarded before the
+// connection is closed (a "lingering close"). It covers a body of the largest
+// MAX_MESSAGE_SIZE that can be configured several times over, costs no memory,
+// and is bounded in time by the read timeout.
+const maxDrain = 64 << 20
 
 func (s *Server) release(buf *bytes.Buffer) {
 	if buf.Cap() > 256<<10 {

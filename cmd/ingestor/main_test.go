@@ -18,7 +18,17 @@ import (
 	"time"
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/config"
+	"github.com/okzgn/wal-ingestion-engine-go/internal/pipeline"
+	"github.com/okzgn/wal-ingestion-engine-go/internal/server"
 )
+
+// client keeps its connections alive. The default client keeps two per host:
+// under load every other request opens a new socket, and on Windows a few
+// thousand of them in TIME_WAIT exhaust the ephemeral ports.
+var client = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 30 * time.Second},
+}
 
 // lookup mimics os.LookupEnv over a map.
 func lookup(m map[string]string) func(string) (string, bool) {
@@ -60,6 +70,34 @@ func TestHealthcheckExitCodes(t *testing.T) {
 	buf.Reset()
 	if code := run([]string{"healthcheck"}, lookup(map[string]string{"ADMIN_ADDR": ""}), &buf); code != 1 || !strings.Contains(buf.String(), "disabled") {
 		t.Fatalf("disabled admin: exit %d, output %q", code, buf.String())
+	}
+}
+
+// Regression R9: the HTTP limit and the file reader's limit are two constants
+// in two packages; if they drift apart, a message can be acknowledged and then
+// be too long to deliver.
+func TestMessageLimitNeverExceedsTheReaders(t *testing.T) {
+	if config.MaxMessageSizeLimit > pipeline.DefaultMaxLineSize {
+		t.Fatalf("MAX_MESSAGE_SIZE may reach %d but the reader delivers lines up to %d",
+			config.MaxMessageSizeLimit, pipeline.DefaultMaxLineSize)
+	}
+	c, err := config.Load(nil, lookup(map[string]string{"MAX_MESSAGE_SIZE": "16MiB", "MAX_BATCH_BYTES": "16MiB"}))
+	if err != nil || c.MaxMessageSize != config.MaxMessageSizeLimit {
+		t.Fatalf("the limit itself must be accepted: %v", err)
+	}
+}
+
+// The scheme names are spelled in two packages (config validates them, server
+// implements them): every name the configuration accepts must be implemented.
+func TestSignatureSchemesAgree(t *testing.T) {
+	for _, scheme := range []string{"generic", "github", "stripe", "slack", "GitHub"} {
+		c, err := config.Load(nil, lookup(map[string]string{"WEBHOOK_SECRET": "s", "WEBHOOK_SIGNATURE_SCHEME": scheme}))
+		if err != nil {
+			t.Fatalf("%s: %v", scheme, err)
+		}
+		if !server.ValidScheme(c.WebhookSignatureScheme) {
+			t.Errorf("config accepts %q but the server does not implement it", scheme)
+		}
 	}
 }
 
@@ -121,7 +159,7 @@ func TestServe_GracefulShutdownLosesNothing(t *testing.T) {
 	defer down.Close()
 
 	dir := t.TempDir()
-	addr, admin := freeAddr(t), freeAddr(t)
+	addr, admin := freeAddrs(t)
 	cfg, err := config.Load(nil, lookup(map[string]string{
 		"LISTEN_ADDR": addr, "ADMIN_ADDR": admin, "DATA_DIR": dir, "SINK_URL": down.URL,
 		"ROTATION_INTERVAL": "100ms", "SHUTDOWN_TIMEOUT": "10s", "LOG_LEVEL": "error",
@@ -137,10 +175,10 @@ func TestServe_GracefulShutdownLosesNothing(t *testing.T) {
 		go func() { done <- serve(ctx, cfg, log) }()
 		deadline := time.Now().Add(10 * time.Second)
 		for {
-			if resp, err := http.Get("http://" + admin + "/readyz"); err == nil {
+			if resp, err := client.Get("http://" + admin + "/readyz"); err == nil {
 				resp.Body.Close()
 				if resp.StatusCode == 200 {
-					if r2, err := http.Post("http://"+addr+"/webhook", "application/json", strings.NewReader("{}")); err == nil {
+					if r2, err := client.Post("http://"+addr+"/webhook", "application/json", strings.NewReader("{}")); err == nil {
 						r2.Body.Close()
 						return cancel, done
 					}
@@ -171,7 +209,7 @@ func TestServe_GracefulShutdownLosesNothing(t *testing.T) {
 				default:
 				}
 				id := fmt.Sprintf("w%d-%d", w, i)
-				resp, err := http.Post("http://"+addr+"/webhook", "application/json", strings.NewReader(fmt.Sprintf(`{"id":%q}`, id)))
+				resp, err := client.Post("http://"+addr+"/webhook", "application/json", strings.NewReader(fmt.Sprintf(`{"id":%q}`, id)))
 				if err != nil {
 					continue
 				}
@@ -225,12 +263,20 @@ func TestServe_GracefulShutdownLosesNothing(t *testing.T) {
 	t.Logf("acknowledged before shutdown: %d, all delivered", len(acked))
 }
 
-func freeAddr(t *testing.T) string {
+// freeAddrs returns two distinct free addresses. Both listeners are held open
+// until both are known: asking for one port, releasing it and asking again can
+// return the same port twice.
+func freeAddrs(t *testing.T) (string, string) {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	a, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	return l.Addr().String()
+	defer a.Close()
+	b, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	return a.Addr().String(), b.Addr().String()
 }
