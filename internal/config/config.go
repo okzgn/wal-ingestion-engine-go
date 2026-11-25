@@ -44,6 +44,7 @@ type Config struct {
 	QueueSize        int
 	MaxInflightBytes int64
 	MaxBacklogBytes  int64
+	MaxBodyMemory    int64
 
 	Workers               int
 	SinkConcurrency       int
@@ -102,6 +103,7 @@ func settings(c *Config) []setting {
 		{"QUEUE_SIZE", "queue-size", "4096", "capacity of the writer queue", num(&c.QueueSize)},
 		{"MAX_INFLIGHT_BYTES", "max-inflight-bytes", "64MiB", "503 above this many bytes waiting for the disk", size(&c.MaxInflightBytes)},
 		{"MAX_BACKLOG_BYTES", "max-backlog-bytes", "1GiB", "503 above this much unprocessed data on disk", size(&c.MaxBacklogBytes)},
+		{"MAX_BODY_MEMORY", "max-body-memory", "256MiB", "503 above this many bytes of request bodies in memory at once (0 = no limit)", size(&c.MaxBodyMemory)},
 
 		{"WORKERS", "workers", "4", "files processed at the same time", num(&c.Workers)},
 		{"SINK_CONCURRENCY", "sink-concurrency", "8", "messages of one file in delivery at the same time (WORKERS=1 with 1 here = in-order delivery)", num(&c.SinkConcurrency)},
@@ -243,6 +245,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxBacklogBytes < 0 {
 		bad("MAX_BACKLOG_BYTES must not be negative (0 disables the limit)")
+	}
+	if c.MaxBodyMemory != 0 && c.MaxBodyMemory < c.MaxMessageSize {
+		bad("MAX_BODY_MEMORY must be at least MAX_MESSAGE_SIZE, or the largest message could never be accepted (0 disables the limit)")
 	}
 	if c.Workers < 1 {
 		bad("WORKERS must be at least 1")

@@ -134,6 +134,7 @@ func TestLoad_Errors(t *testing.T) {
 		{"write <= ack", nil, map[string]string{"WRITE_TIMEOUT": "5s", "ACK_TIMEOUT": "5s"}, "WRITE_TIMEOUT"},
 		{"inflight below message", nil, map[string]string{"MAX_INFLIGHT_BYTES": "1KiB"}, "MAX_INFLIGHT_BYTES"},
 		{"batch below message", nil, map[string]string{"MAX_BATCH_BYTES": "1KiB"}, "MAX_BATCH_BYTES"},
+		{"body memory below message", nil, map[string]string{"MAX_BODY_MEMORY": "1KiB"}, "MAX_BODY_MEMORY"},
 		{"bad sink url", nil, map[string]string{"SINK_URL": "ftp://x"}, "SINK_URL"},
 		{"credentials in sink url", nil, map[string]string{"SINK_URL": "https://user:pass@x.example/e"}, "SINK_AUTHORIZATION"},
 		{"bad sink header", nil, map[string]string{"SINK_HEADERS": "no colon"}, "SINK_HEADERS"},

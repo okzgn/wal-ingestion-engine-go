@@ -195,6 +195,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		IdleTimeout:        cfg.IdleTimeout,
 		AckTimeout:         cfg.AckTimeout,
 		MaxBacklogBytes:    cfg.MaxBacklogBytes,
+		MaxBodyMemory:      cfg.MaxBodyMemory,
 		RateLimitPerMinute: cfg.RateLimitPerMinute,
 		TrustedProxies:     cfg.TrustedProxies,
 		ProxyHeader:        cfg.ProxyHeader,
