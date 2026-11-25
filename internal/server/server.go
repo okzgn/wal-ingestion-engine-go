@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,10 +62,14 @@ type Config struct {
 	TrustedProxies []string
 	ProxyHeader    string // default X-Forwarded-For
 
-	// HMAC verification is enabled when Secret is not empty.
-	Secret          string
+	// Signature verification is enabled when Secret is not empty.
+	Secret string
+	// SignatureScheme is how the sender signs (default SchemeGeneric).
+	SignatureScheme Scheme
+	// SignatureHeader and TimestampHeader override the headers of the scheme.
+	// With the generic scheme a TimestampHeader enables the anti-replay check.
 	SignatureHeader string
-	TimestampHeader string // optional: enables the anti-replay check
+	TimestampHeader string
 	Tolerance       time.Duration
 }
 
@@ -99,9 +104,11 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 	if cfg.AckTimeout <= 0 {
 		cfg.AckTimeout = 5 * time.Second
 	}
-	if cfg.SignatureHeader == "" {
-		cfg.SignatureHeader = "X-Signature-256"
+	if cfg.SignatureScheme == "" {
+		cfg.SignatureScheme = SchemeGeneric
 	}
+	cfg.SignatureScheme = Scheme(strings.ToLower(string(cfg.SignatureScheme)))
+	cfg.SignatureHeader, cfg.TimestampHeader = SchemeHeaders(cfg.SignatureScheme, cfg.SignatureHeader, cfg.TimestampHeader)
 	if cfg.ProxyHeader == "" {
 		cfg.ProxyHeader = fiber.HeaderXForwardedFor
 	}
@@ -113,7 +120,7 @@ func New(cfg Config, w Appender, backlog Backlog, log *slog.Logger) *Server {
 	}
 	s.pool.New = func() any { return new(bytes.Buffer) }
 	if cfg.Secret != "" {
-		s.ver = NewVerifier(cfg.Secret, cfg.TimestampHeader != "", cfg.Tolerance)
+		s.ver = NewSchemeVerifier(cfg.SignatureScheme, cfg.Secret, cfg.TimestampHeader != "", cfg.Tolerance)
 	}
 
 	fcfg := fiber.Config{

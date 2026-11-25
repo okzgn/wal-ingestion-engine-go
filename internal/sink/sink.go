@@ -4,11 +4,14 @@ package sink
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -76,6 +79,14 @@ type HTTPConfig struct {
 
 	// PermanentStatuses replaces DefaultPermanentStatuses when not nil.
 	PermanentStatuses []int
+
+	// KeyPointer, when not empty, is a JSON Pointer (RFC 6901, for example
+	// "/id") to the sender's own identifier of the message. Its value becomes
+	// the Idempotency-Key, so the destination can also discard a message the
+	// sender delivered twice (after a timeout or a 503 it retries, and the
+	// engine stores the retry as a new message with a new engine key). A
+	// message where the pointer finds no usable value keeps the engine key.
+	KeyPointer string
 }
 
 // HTTP forwards each message with a POST.
@@ -83,7 +94,12 @@ type HTTP struct {
 	cfg       HTTPConfig
 	client    *http.Client
 	permanent []int
+	pointer   []string // parsed KeyPointer; nil = use the engine key
 }
+
+// DeliveryIDHeader always carries the engine key, "<file>:<line>": it names
+// one stored message, and is the same on every attempt to deliver it.
+const DeliveryIDHeader = "X-Delivery-Id"
 
 // NewHTTP builds a forwarder. Redirects are never followed: a 301, 302 or 303
 // would turn the POST into a body-less GET, and a 200 on that GET would count
@@ -99,8 +115,10 @@ func NewHTTP(cfg HTTPConfig) *HTTP {
 	if perm == nil {
 		perm = DefaultPermanentStatuses
 	}
+	pointer, _ := ParsePointer(cfg.KeyPointer) // validated by the configuration
 	return &HTTP{
 		cfg:       cfg,
+		pointer:   pointer,
 		permanent: slices.Clone(perm),
 		client: &http.Client{
 			Timeout: cfg.Timeout,
@@ -117,6 +135,82 @@ func NewHTTP(cfg HTTPConfig) *HTTP {
 			},
 		},
 	}
+}
+
+// ParsePointer splits a JSON Pointer (RFC 6901) into its reference tokens.
+// The empty pointer means "no pointer" and yields nil.
+func ParsePointer(p string) ([]string, error) {
+	if p == "" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(p, "/") {
+		return nil, fmt.Errorf("JSON pointer %q must start with '/'", p)
+	}
+	tokens := strings.Split(p[1:], "/")
+	for i, t := range tokens {
+		for j := 0; j < len(t); j++ {
+			if t[j] == '~' && (j+1 >= len(t) || (t[j+1] != '0' && t[j+1] != '1')) {
+				return nil, fmt.Errorf("JSON pointer %q: '~' must be followed by 0 or 1", p)
+			}
+		}
+		tokens[i] = strings.ReplaceAll(strings.ReplaceAll(t, "~1", "/"), "~0", "~")
+	}
+	return tokens, nil
+}
+
+// maxMessageKey bounds a key taken from the message: it travels in a header.
+const maxMessageKey = 200
+
+// MessageKey resolves pointer inside the JSON message and returns the value
+// as an idempotency key. It reports false when there is no pointer, when the
+// value is missing or is not a string or a number, or when it could not go in
+// a header (empty, too long, or with characters a header value cannot hold).
+func MessageKey(line []byte, pointer []string) (string, bool) {
+	if pointer == nil {
+		return "", false
+	}
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber() // keep large identifiers exact
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return "", false
+	}
+	for _, token := range pointer {
+		switch node := doc.(type) {
+		case map[string]any:
+			next, ok := node[token]
+			if !ok {
+				return "", false
+			}
+			doc = next
+		case []any:
+			i, err := strconv.Atoi(token)
+			if err != nil || i < 0 || i >= len(node) || (len(token) > 1 && token[0] == '0') {
+				return "", false
+			}
+			doc = node[i]
+		default:
+			return "", false
+		}
+	}
+	var key string
+	switch v := doc.(type) {
+	case string:
+		key = v
+	case json.Number:
+		key = v.String()
+	default:
+		return "", false
+	}
+	if key == "" || len(key) > maxMessageKey {
+		return "", false
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x21 || key[i] > 0x7e { // visible ASCII only
+			return "", false
+		}
+	}
+	return key, true
 }
 
 // Deliver implements Sink. 2xx is success; a status in PermanentStatuses is
@@ -139,6 +233,10 @@ func (h *HTTP) Deliver(ctx context.Context, key string, line []byte) error {
 	}
 	if h.cfg.Authorization != "" {
 		req.Header.Set("Authorization", h.cfg.Authorization)
+	}
+	req.Header.Set(DeliveryIDHeader, key)
+	if own, ok := MessageKey(line, h.pointer); ok {
+		key = own
 	}
 	req.Header.Set("Idempotency-Key", key)
 

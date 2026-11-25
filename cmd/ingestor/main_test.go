@@ -19,6 +19,7 @@ import (
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/config"
 	"github.com/okzgn/wal-ingestion-engine-go/internal/pipeline"
+	"github.com/okzgn/wal-ingestion-engine-go/internal/server"
 )
 
 // lookup mimics os.LookupEnv over a map.
@@ -75,6 +76,20 @@ func TestMessageLimitNeverExceedsTheReaders(t *testing.T) {
 	c, err := config.Load(nil, lookup(map[string]string{"MAX_MESSAGE_SIZE": "16MiB", "MAX_BATCH_BYTES": "16MiB"}))
 	if err != nil || c.MaxMessageSize != config.MaxMessageSizeLimit {
 		t.Fatalf("the limit itself must be accepted: %v", err)
+	}
+}
+
+// The scheme names are spelled in two packages (config validates them, server
+// implements them): every name the configuration accepts must be implemented.
+func TestSignatureSchemesAgree(t *testing.T) {
+	for _, scheme := range []string{"generic", "github", "stripe", "slack", "GitHub"} {
+		c, err := config.Load(nil, lookup(map[string]string{"WEBHOOK_SECRET": "s", "WEBHOOK_SIGNATURE_SCHEME": scheme}))
+		if err != nil {
+			t.Fatalf("%s: %v", scheme, err)
+		}
+		if !server.ValidScheme(c.WebhookSignatureScheme) {
+			t.Errorf("config accepts %q but the server does not implement it", scheme)
+		}
 	}
 }
 

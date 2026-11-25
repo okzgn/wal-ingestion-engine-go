@@ -57,12 +57,14 @@ type Config struct {
 	SinkAuthorization     string
 	SinkHeaders           http.Header
 	SinkPermanentStatuses []int
+	SinkKeyJSONPointer    string
 	FileRetryBase         time.Duration
 	FileRetryMax          time.Duration
 	MaxFileAttempts       int
 	MaxLineAttempts       int
 
 	WebhookSecret          string
+	WebhookSignatureScheme string
 	WebhookSignatureHeader string
 	WebhookTimestampHeader string
 	WebhookTolerance       time.Duration
@@ -115,6 +117,7 @@ func settings(c *Config) []setting {
 		{"SINK_BACKOFF_MAX", "sink-backoff-max", "30s", "per-message retry delay cap", dur(&c.SinkBackoffMax)},
 		{"SINK_AUTHORIZATION", "", "", "Authorization header sent with every delivery, e.g. 'Bearer <token>'", str(&c.SinkAuthorization)},
 		{"SINK_HEADERS", "", "", "extra delivery headers: 'Name: value, Name2: value2'", headers(&c.SinkHeaders)},
+		{"SINK_KEY_JSON_POINTER", "sink-key-json-pointer", "", "JSON Pointer (e.g. /id) to the sender's message id; its value becomes the Idempotency-Key (empty = <file>:<line>)", str(&c.SinkKeyJSONPointer)},
 		{"SINK_PERMANENT_STATUSES", "sink-permanent-statuses", "400,413,415,422", "destination statuses that dead-letter a message instead of retrying it", ints(&c.SinkPermanentStatuses)},
 		{"FILE_RETRY_BASE", "file-retry-base", "1s", "first delay before a postponed file is retried", dur(&c.FileRetryBase)},
 		{"FILE_RETRY_MAX", "file-retry-max", "1m", "postponed file retry delay cap", dur(&c.FileRetryMax)},
@@ -122,8 +125,9 @@ func settings(c *Config) []setting {
 		{"MAX_LINE_ATTEMPTS", "max-line-attempts", "10", "dead-letter a message after it stalls its file this many times while the destination accepts others (0 = never)", num(&c.MaxLineAttempts)},
 
 		{"WEBHOOK_SECRET", "", "", "HMAC-SHA256 secret; enables signature verification", str(&c.WebhookSecret)},
-		{"WEBHOOK_SIGNATURE_HEADER", "webhook-signature-header", "X-Signature-256", "header carrying sha256=<hex>", str(&c.WebhookSignatureHeader)},
-		{"WEBHOOK_TIMESTAMP_HEADER", "webhook-timestamp-header", "", "header carrying unix seconds; enables the anti-replay check", str(&c.WebhookTimestampHeader)},
+		{"WEBHOOK_SIGNATURE_SCHEME", "webhook-signature-scheme", "generic", "how the sender signs: generic, github, stripe or slack", str(&c.WebhookSignatureScheme)},
+		{"WEBHOOK_SIGNATURE_HEADER", "webhook-signature-header", "", "signature header (empty = the scheme's own; X-Signature-256 for generic)", str(&c.WebhookSignatureHeader)},
+		{"WEBHOOK_TIMESTAMP_HEADER", "webhook-timestamp-header", "", "generic scheme: header carrying unix seconds, enables the anti-replay check; slack: overrides X-Slack-Request-Timestamp", str(&c.WebhookTimestampHeader)},
 		{"WEBHOOK_TOLERANCE", "webhook-tolerance", "5m", "accepted clock skew for the timestamp", dur(&c.WebhookTolerance)},
 		{"RATE_LIMIT_PER_MINUTE", "rate-limit-per-minute", "0", "per-client request limit (0 = off)", num(&c.RateLimitPerMinute)},
 		{"TRUSTED_PROXIES", "trusted-proxies", "", "IPs or CIDRs of reverse proxies whose PROXY_HEADER gives the client IP (empty = the TCP peer is the client)", list(&c.TrustedProxies)},
@@ -267,6 +271,17 @@ func (c *Config) Validate() error {
 			bad("SINK_URL must not carry credentials (they would show up in logs); use SINK_AUTHORIZATION")
 		}
 	}
+	if p := c.SinkKeyJSONPointer; p != "" {
+		ok := strings.HasPrefix(p, "/")
+		for i := 0; ok && i < len(p); i++ {
+			if p[i] == '~' && (i+1 >= len(p) || (p[i+1] != '0' && p[i+1] != '1')) {
+				ok = false
+			}
+		}
+		if !ok {
+			bad("SINK_KEY_JSON_POINTER must be a JSON Pointer such as /id or /data/object/id, got %q", p)
+		}
+	}
 	if c.SinkTimeout <= 0 {
 		bad("SINK_TIMEOUT must be positive")
 	}
@@ -290,8 +305,17 @@ func (c *Config) Validate() error {
 	if c.MaxLineAttempts < 0 {
 		bad("MAX_LINE_ATTEMPTS must not be negative (0 never gives up on a message)")
 	}
-	if c.WebhookSignatureHeader == "" {
-		bad("WEBHOOK_SIGNATURE_HEADER must not be empty")
+	switch scheme := strings.ToLower(c.WebhookSignatureScheme); scheme {
+	case "generic", "slack":
+	case "github", "stripe":
+		if c.WebhookTimestampHeader != "" {
+			bad("WEBHOOK_TIMESTAMP_HEADER does not apply to the %s scheme", scheme)
+		}
+	default:
+		bad("WEBHOOK_SIGNATURE_SCHEME must be generic, github, stripe or slack, got %q", c.WebhookSignatureScheme)
+	}
+	if c.WebhookSignatureScheme != "" && !strings.EqualFold(c.WebhookSignatureScheme, "generic") && c.WebhookSecret == "" {
+		bad("WEBHOOK_SIGNATURE_SCHEME requires WEBHOOK_SECRET")
 	}
 	if c.WebhookTimestampHeader != "" && c.WebhookSecret == "" {
 		bad("WEBHOOK_TIMESTAMP_HEADER requires WEBHOOK_SECRET")
@@ -436,8 +460,8 @@ func splitList(v string) []string {
 }
 
 // ParseHeaders parses "Name: value, Name2: value2". Headers are separated by
-// commas or newlines, so a value cannot contain a comma. Idempotency-Key is
-// reserved: the engine sets it on every delivery.
+// commas or newlines, so a value cannot contain a comma. Idempotency-Key and
+// X-Delivery-Id are reserved: the engine sets them on every delivery.
 func ParseHeaders(s string) (http.Header, error) {
 	h := http.Header{}
 	for _, item := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' }) {
@@ -450,8 +474,10 @@ func ParseHeaders(s string) (http.Header, error) {
 		if !ok || !validHeaderName(name) {
 			return nil, fmt.Errorf("header %q is not of the form \"Name: value\"", item)
 		}
-		if strings.EqualFold(name, "Idempotency-Key") {
-			return nil, errors.New("header Idempotency-Key is set by the engine and cannot be overridden")
+		for _, reserved := range []string{"Idempotency-Key", "X-Delivery-Id"} {
+			if strings.EqualFold(name, reserved) {
+				return nil, fmt.Errorf("header %s is set by the engine and cannot be overridden", reserved)
+			}
 		}
 		h.Add(name, value)
 	}

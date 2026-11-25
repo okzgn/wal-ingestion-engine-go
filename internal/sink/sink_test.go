@@ -3,9 +3,12 @@ package sink
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -153,5 +156,91 @@ func TestIsPermanent_Wrapped(t *testing.T) {
 func TestNoop(t *testing.T) {
 	if err := (Noop{}).Deliver(context.Background(), "k", nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestParsePointer(t *testing.T) {
+	for in, want := range map[string][]string{
+		"/id":             {"id"},
+		"/data/object/id": {"data", "object", "id"},
+		"/a~1b/c~0d":      {"a/b", "c~d"},
+		"/":               {""},
+		"/items/0":        {"items", "0"},
+	} {
+		got, err := ParsePointer(in)
+		if err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("ParsePointer(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	if got, err := ParsePointer(""); got != nil || err != nil {
+		t.Errorf("the empty pointer means no pointer, got %v, %v", got, err)
+	}
+	for _, in := range []string{"id", "/a~", "/a~2"} {
+		if _, err := ParsePointer(in); err == nil {
+			t.Errorf("ParsePointer(%q) should fail", in)
+		}
+	}
+}
+
+func TestMessageKey(t *testing.T) {
+	ptr := func(p string) []string { tokens, _ := ParsePointer(p); return tokens }
+	doc := `{"id":"evt_1","n":12345678901234567890,"data":{"object":{"id":"ch_9"}},"items":[{"k":"first"}],"flag":true,"empty":"","sp":"a b","nl":"a\nb"}`
+	for pointer, want := range map[string]string{
+		"/id":             "evt_1",
+		"/n":              "12345678901234567890", // exact: not rounded through a float
+		"/data/object/id": "ch_9",
+		"/items/0/k":      "first",
+	} {
+		if got, ok := MessageKey([]byte(doc), ptr(pointer)); !ok || got != want {
+			t.Errorf("%s = %q, %v; want %q", pointer, got, ok, want)
+		}
+	}
+	// No usable value: the engine key is kept.
+	for _, pointer := range []string{"/missing", "/data", "/flag", "/empty", "/sp", "/nl", "/items/1", "/items/x", "/items/00", "/id/deeper"} {
+		if got, ok := MessageKey([]byte(doc), ptr(pointer)); ok {
+			t.Errorf("%s resolved to %q, want no key", pointer, got)
+		}
+	}
+	if _, ok := MessageKey([]byte(doc), nil); ok {
+		t.Error("no pointer, no key")
+	}
+	if _, ok := MessageKey([]byte(`{"id":"`+strings.Repeat("x", 300)+`"}`), ptr("/id")); ok {
+		t.Error("a key too long for a header must be refused")
+	}
+	if _, ok := MessageKey([]byte(`[1,2`), ptr("/0")); ok {
+		t.Error("invalid JSON has no key")
+	}
+}
+
+// The sender retries after a timeout and the engine stores both copies: each
+// has its own engine key, so only the sender's id lets the backend see that
+// they are the same message.
+func TestHTTP_KeyPointerDeduplicatesSenderRetries(t *testing.T) {
+	var mu sync.Mutex
+	var idem, delivery []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		idem = append(idem, r.Header.Get("Idempotency-Key"))
+		delivery = append(delivery, r.Header.Get(DeliveryIDHeader))
+		mu.Unlock()
+	}))
+	defer srv.Close()
+
+	h := NewHTTP(HTTPConfig{URL: srv.URL, KeyPointer: "/id", Headers: http.Header{"X-Delivery-Id": {"must-not-override"}}})
+	ctx := context.Background()
+	for _, d := range []struct{ key, line string }{
+		{"ingest_1.list:7", `{"id":"evt_42","n":1}`},
+		{"ingest_2.list:3", `{"id":"evt_42","n":1}`}, // the sender's retry
+		{"ingest_2.list:4", `{"no_id":true}`},        // nothing to point at
+	} {
+		if err := h.Deliver(ctx, d.key, []byte(d.line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fmt.Sprint(idem) != "[evt_42 evt_42 ingest_2.list:4]" {
+		t.Fatalf("Idempotency-Key = %v", idem)
+	}
+	if fmt.Sprint(delivery) != "[ingest_1.list:7 ingest_2.list:3 ingest_2.list:4]" {
+		t.Fatalf("%s = %v; it must always be the engine key", DeliveryIDHeader, delivery)
 	}
 }

@@ -155,6 +155,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 			Authorization:     cfg.SinkAuthorization,
 			Headers:           cfg.SinkHeaders,
 			PermanentStatuses: cfg.SinkPermanentStatuses,
+			KeyPointer:        cfg.SinkKeyJSONPointer,
 		})
 	} else {
 		log.Warn("SINK_URL is not set: messages are stored and then discarded")
@@ -200,6 +201,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		TrustedProxies:     cfg.TrustedProxies,
 		ProxyHeader:        cfg.ProxyHeader,
 		Secret:             cfg.WebhookSecret,
+		SignatureScheme:    server.Scheme(cfg.WebhookSignatureScheme),
 		SignatureHeader:    cfg.WebhookSignatureHeader,
 		TimestampHeader:    cfg.WebhookTimestampHeader,
 		Tolerance:          cfg.WebhookTolerance,

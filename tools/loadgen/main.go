@@ -14,11 +14,41 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// sign adds the signature headers of the given scheme, as the engine's
+// WEBHOOK_SIGNATURE_SCHEME expects them.
+func sign(req *http.Request, scheme, header, secret string, body []byte) {
+	mac := func(prefix string) string {
+		m := hmac.New(sha256.New, []byte(secret))
+		m.Write([]byte(prefix))
+		m.Write(body)
+		return hex.EncodeToString(m.Sum(nil))
+	}
+	name := func(def string) string {
+		if header != "" {
+			return header
+		}
+		return def
+	}
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	switch scheme {
+	case "github":
+		req.Header.Set(name("X-Hub-Signature-256"), "sha256="+mac(""))
+	case "stripe":
+		req.Header.Set(name("Stripe-Signature"), "t="+ts+",v1="+mac(ts+"."))
+	case "slack":
+		req.Header.Set("X-Slack-Request-Timestamp", ts)
+		req.Header.Set(name("X-Slack-Signature"), "v0="+mac("v0:"+ts+":"))
+	default:
+		req.Header.Set(name("X-Signature-256"), "sha256="+mac(""))
+	}
+}
 
 func main() {
 	var (
@@ -27,7 +57,8 @@ func main() {
 		conc    = flag.Int("c", 64, "concurrent workers")
 		size    = flag.Int("size", 200, "approximate payload size in bytes")
 		secret  = flag.String("secret", "", "HMAC-SHA256 secret (optional)")
-		header  = flag.String("header", "X-Signature-256", "signature header name")
+		scheme  = flag.String("scheme", "generic", "signature scheme: generic, github, stripe or slack (needs -secret)")
+		header  = flag.String("header", "", "signature header name (default: the scheme's own)")
 		idsFile = flag.String("ids", "", "write the id of every request acknowledged with 200 to this file")
 		prefix  = flag.String("prefix", "m", "message id prefix")
 	)
@@ -71,9 +102,7 @@ func main() {
 				req, _ := http.NewRequest(http.MethodPost, *url, bytes.NewReader(body))
 				req.Header.Set("Content-Type", "application/json")
 				if *secret != "" {
-					mac := hmac.New(sha256.New, []byte(*secret))
-					mac.Write(body)
-					req.Header.Set(*header, "sha256="+hex.EncodeToString(mac.Sum(nil)))
+					sign(req, *scheme, *header, *secret, body)
 				}
 				t0 := time.Now()
 				resp, err := client.Do(req)
