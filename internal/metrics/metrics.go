@@ -28,6 +28,10 @@ var (
 
 	BacklogFiles = expvar.NewInt("backlog_files")
 	BacklogBytes = expvar.NewInt("backlog_bytes")
+	// HandoffPending counts rotated files that could not be moved to
+	// processing/ yet and are being retried. Anything above 0 for long means
+	// the data directory needs attention.
+	HandoffPending = expvar.NewInt("handoff_pending")
 
 	Delivered    = expvar.NewInt("delivered")
 	Retried      = expvar.NewInt("retried")

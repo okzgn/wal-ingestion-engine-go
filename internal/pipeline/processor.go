@@ -29,6 +29,13 @@ import (
 // the runner schedules it again.
 var ErrRetryLater = errors.New("file postponed, will be retried")
 
+// ErrCleanupPending is returned (wrapped) when every line of a file was handled
+// but the file itself could not be removed. It is a kind of ErrRetryLater: the
+// checkpoint covers the whole file, so the next attempt delivers nothing again
+// and only retries the removal. It is not a delivery failure and must not
+// count towards giving up on the file.
+var ErrCleanupPending = fmt.Errorf("%w: processed file could not be removed", ErrRetryLater)
+
 // errDeadLetters marks a failure to write or sync failed/<file>.bad. The
 // checkpoint must then not advance and the data file must not be deleted,
 // otherwise a rejected line would vanish without a trace.
@@ -67,6 +74,9 @@ type Options struct {
 type Processor struct {
 	o        Options
 	interval uint64
+
+	// remove deletes a finished file or its checkpoint; tests inject faults here.
+	remove func(path string) error
 }
 
 // NewProcessor applies defaults and returns a Processor.
@@ -95,6 +105,7 @@ func NewProcessor(o Options) *Processor {
 	return &Processor{
 		o:        o,
 		interval: uint64(o.CheckpointInterval), //nolint:gosec // #nosec G115 -- forced to be >= 1 just above
+		remove:   func(path string) error { return fsutil.RemoveWithRetry(path, 5) },
 	}
 }
 
@@ -102,7 +113,8 @@ func NewProcessor(o Options) *Processor {
 //
 //   - nil when the file was fully handled and has been deleted;
 //   - ctx.Err() when interrupted (progress is checkpointed, the file is kept);
-//   - an error wrapping ErrRetryLater when the file must be tried again later.
+//   - an error wrapping ErrRetryLater when the file must be tried again later
+//     (ErrCleanupPending when only its removal is left).
 func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 	name := filepath.Base(path)
 	log := p.o.Logger.With("file", name)
@@ -255,13 +267,13 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 	release()
 	log.Info("file processed", "lines", lineNo)
 
-	if err := fsutil.RemoveWithRetry(path, 5); err != nil {
-		// Keep the checkpoint: recovery will find a fully-checkpointed file,
-		// redeliver nothing and try the removal again.
-		log.Warn("cannot remove processed file; kept for the next recovery", "err", err)
-		return nil
+	if err := p.remove(path); err != nil {
+		// Keep the checkpoint: the next attempt finds a fully-checkpointed
+		// file, redelivers nothing and tries the removal again.
+		log.Warn("cannot remove processed file; the removal will be retried", "err", err)
+		return fmt.Errorf("%w: %v", ErrCleanupPending, err)
 	}
-	_ = fsutil.RemoveWithRetry(path+spool.CheckpointExt, 5)
+	_ = p.remove(path + spool.CheckpointExt)
 	return nil
 }
 

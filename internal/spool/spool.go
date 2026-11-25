@@ -8,13 +8,20 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gofrs/flock"
 	"github.com/okzgn/wal-ingestion-engine-go/internal/fsutil"
+	"github.com/okzgn/wal-ingestion-engine-go/internal/metrics"
 )
 
 // ErrLocked is returned when another instance already owns the data directory.
 var ErrLocked = errors.New("data directory is locked by another instance")
+
+// errGone means a rotated file is no longer where the writer left it.
+var errGone = errors.New("file is gone")
 
 // Spool ties the directories, the dispatcher and the instance lock together.
 type Spool struct {
@@ -23,6 +30,28 @@ type Spool struct {
 
 	log  *slog.Logger
 	lock *flock.Flock
+
+	// rename moves a file between spool directories; tests inject faults here.
+	rename             func(oldPath, newPath string) error
+	retryMin, retryMax time.Duration
+
+	// stranded holds, in rotation order, the files whose move to processing/
+	// failed. A background goroutine keeps retrying them, so a transient
+	// failure (a full or read-only directory, a handle held by a scanner) no
+	// longer leaves acknowledged messages waiting for the next restart. Their
+	// bytes count as backlog: the admission limit must see them.
+	mu            sync.Mutex
+	stranded      []strandedFile
+	strandedBytes atomic.Int64
+	wake          chan struct{}
+	stop          chan struct{}
+	done          chan struct{}
+	closeOnce     sync.Once
+}
+
+type strandedFile struct {
+	path string
+	size int64
 }
 
 // Open creates the directories and takes the exclusive instance lock. A second
@@ -44,33 +73,150 @@ func Open(root string, log *slog.Logger) (*Spool, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrLocked, root)
 	}
-	return &Spool{Dirs: dirs, Disp: NewDispatcher(), log: log, lock: lock}, nil
+	s := &Spool{
+		Dirs: dirs, Disp: NewDispatcher(), log: log, lock: lock,
+		rename:   func(oldPath, newPath string) error { return fsutil.RenameWithRetry(oldPath, newPath, 5) },
+		retryMin: time.Second,
+		retryMax: 30 * time.Second,
+		wake:     make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go s.retryStranded()
+	return s, nil
 }
 
-// Close releases the instance lock.
+// Close stops the handoff retries and releases the instance lock. Files that
+// are still stranded stay in ingestions/, where the next Recover adopts them.
 func (s *Spool) Close() error {
+	s.closeOnce.Do(func() { close(s.stop) })
+	<-s.done
 	s.Disp.Close()
 	return s.lock.Unlock()
 }
 
+// BacklogBytes is everything that is on disk and not yet delivered: the files
+// known to the dispatcher plus the ones still waiting to be moved to it.
+func (s *Spool) BacklogBytes() int64 {
+	return s.Disp.BacklogBytes() + s.strandedBytes.Load()
+}
+
+// BacklogFiles is the number of files not yet fully processed.
+func (s *Spool) BacklogFiles() int {
+	s.mu.Lock()
+	n := len(s.stranded)
+	s.mu.Unlock()
+	return s.Disp.BacklogFiles() + n
+}
+
 // Ready hands a closed WAL file over to the workers: it is moved atomically
-// to processing/ and queued. A failed move leaves the file in ingestions/,
-// where the next Recover picks it up.
+// to processing/ and queued. If the move fails the file stays in ingestions/
+// and is retried in the background until it succeeds.
 func (s *Spool) Ready(path string) {
+	// Keep rotation order: while older files are stranded, a newer one waits
+	// behind them instead of overtaking.
+	s.mu.Lock()
+	queued := len(s.stranded) > 0
+	s.mu.Unlock()
+	if !queued {
+		err := s.handoff(path)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, errGone) {
+			s.log.Error("rotated file is gone", "file", filepath.Base(path), "err", err)
+			return
+		}
+		s.log.Error("cannot move file to processing; retrying in the background", "file", filepath.Base(path), "err", err)
+	}
+	s.strand(path)
+}
+
+// handoff moves one file to processing/ and queues it.
+func (s *Spool) handoff(path string) error {
 	name := filepath.Base(path)
 	dst := filepath.Join(s.Dirs.Processing, name)
 	info, err := os.Stat(path)
 	if err != nil {
-		s.log.Error("cannot stat rotated file", "file", name, "err", err)
-		return
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %v", errGone, err)
+		}
+		return err
 	}
-	if err := fsutil.RenameWithRetry(path, dst, 5); err != nil {
-		s.log.Error("cannot move file to processing; it will be retried on restart", "file", name, "err", err)
-		return
+	if err := s.rename(path, dst); err != nil {
+		return err
 	}
 	s.syncDirs(s.Dirs.Ingestions, s.Dirs.Processing)
 	if s.Disp.Add(dst, info.Size()) {
 		s.log.Info("file ready to process", "file", name, "bytes", info.Size())
+	}
+	return nil
+}
+
+// strand records a file that could not be handed over and wakes the retries.
+func (s *Spool) strand(path string) {
+	var size int64
+	if info, err := os.Stat(path); err == nil {
+		size = info.Size()
+	}
+	s.mu.Lock()
+	s.stranded = append(s.stranded, strandedFile{path: path, size: size})
+	metrics.HandoffPending.Set(int64(len(s.stranded)))
+	s.mu.Unlock()
+	s.strandedBytes.Add(size)
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// retryStranded hands the stranded files over, oldest first, with backoff.
+func (s *Spool) retryStranded() {
+	defer close(s.done)
+	delay := s.retryMin
+	for {
+		s.mu.Lock()
+		var head strandedFile
+		pending := len(s.stranded) > 0
+		if pending {
+			head = s.stranded[0]
+		}
+		s.mu.Unlock()
+
+		if !pending {
+			select {
+			case <-s.stop:
+				return
+			case <-s.wake:
+			}
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-s.stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		name := filepath.Base(head.path)
+		err := s.handoff(head.path)
+		switch {
+		case err == nil:
+			s.log.Info("stranded file moved to processing", "file", name)
+		case errors.Is(err, errGone):
+			s.log.Error("stranded file is gone", "file", name, "err", err)
+		default:
+			delay = min(delay*2, s.retryMax)
+			s.log.Warn("still cannot move file to processing", "file", name, "err", err, "retry_in", delay)
+			continue
+		}
+		delay = s.retryMin
+		s.mu.Lock()
+		s.stranded = s.stranded[1:]
+		metrics.HandoffPending.Set(int64(len(s.stranded)))
+		s.mu.Unlock()
+		s.strandedBytes.Add(-head.size)
 	}
 }
 

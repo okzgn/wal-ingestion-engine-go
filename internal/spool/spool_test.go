@@ -304,3 +304,73 @@ func TestDispatcher_ConcurrentWorkersGetEachFileOnce(t *testing.T) {
 		t.Fatalf("backlog not empty: %d", d.BacklogFiles())
 	}
 }
+
+// A failed move to processing/ used to leave the file in ingestions/ until the
+// next restart: acknowledged messages sat undelivered and, not being in the
+// backlog, were invisible to the admission limit. The move is now retried in
+// the background, in rotation order, and the bytes count as backlog meanwhile.
+func TestSpool_ReadyRetriesFailedHandoff(t *testing.T) {
+	sp := open(t)
+	sp.retryMin, sp.retryMax = 5*time.Millisecond, 10*time.Millisecond
+
+	var mu sync.Mutex
+	broken := true
+	sp.rename = func(oldPath, newPath string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if broken {
+			return errors.New("processing/ is read-only")
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	first := write(t, sp.Dirs.Ingestions, NewName(time.Unix(100, 0), 1, 1), "aaaa\n")
+	second := write(t, sp.Dirs.Ingestions, NewName(time.Unix(200, 0), 2, 1), "bb\n")
+	sp.Ready(first)
+	sp.Ready(second)
+
+	if got := sp.BacklogBytes(); got != 8 {
+		t.Fatalf("stranded files must count as backlog: got %d bytes, want 8", got)
+	}
+	if got := sp.BacklogFiles(); got != 2 {
+		t.Fatalf("backlog files = %d, want 2", got)
+	}
+	time.Sleep(40 * time.Millisecond) // several failed retries
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("a stranded file must stay in ingestions/: %v", err)
+	}
+	if sp.Disp.BacklogFiles() != 0 {
+		t.Fatal("nothing can be queued while the move fails")
+	}
+
+	mu.Lock()
+	broken = false
+	mu.Unlock()
+
+	var got []string
+	deadline := time.Now().Add(3 * time.Second)
+	for len(got) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stranded files were never handed over, got %v", got)
+		}
+		got = append(got, drain(sp.Disp)...)
+	}
+	if got[0] != filepath.Base(first) || got[1] != filepath.Base(second) {
+		t.Fatalf("rotation order must be kept, got %v", got)
+	}
+	if n := sp.strandedBytes.Load(); n != 0 {
+		t.Fatalf("stranded bytes must return to 0, got %d", n)
+	}
+	if got := sp.BacklogBytes(); got != 8 {
+		t.Fatalf("the files are now queued and still backlog: got %d, want 8", got)
+	}
+}
+
+// A rotated file that vanished cannot be retried for ever.
+func TestSpool_ReadyDropsAFileThatIsGone(t *testing.T) {
+	sp := open(t)
+	sp.Ready(filepath.Join(sp.Dirs.Ingestions, NewName(time.Unix(1, 0), 1, 1)))
+	if sp.BacklogFiles() != 0 || sp.BacklogBytes() != 0 {
+		t.Fatal("a missing file must not be stranded")
+	}
+}

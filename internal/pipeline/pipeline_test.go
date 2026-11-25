@@ -491,8 +491,12 @@ func TestRunner_RetriesPostponedFilesUntilTheSinkRecovers(t *testing.T) {
 	if len(fs.got()) != 2 {
 		t.Fatalf("delivered %v", fs.got())
 	}
-	if sp.Disp.BacklogFiles() != 0 {
-		t.Fatal("backlog must be empty")
+	// The file leaves the backlog right after it is removed, not atomically with it.
+	for sp.Disp.BacklogFiles() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("backlog must be empty")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	<-done
@@ -676,5 +680,79 @@ func TestProcessor_UnwritableDeadLetterKeepsFile(t *testing.T) {
 	}
 	if seen[`{"i":1}`] == 0 || seen[`{"i":3}`] == 0 {
 		t.Fatalf("valid neighbours must be delivered, got %v", e.sink.got())
+	}
+}
+
+// A processed file that could not be removed used to leave the backlog while
+// staying on disk until the next restart. Its removal is now retried, without
+// redelivering anything and without counting as a failed attempt (so it can
+// never be quarantined as if its messages had not been delivered).
+func TestRunner_RetriesRemovalWithoutRedelivery(t *testing.T) {
+	root := t.TempDir()
+	sp, err := spool.Open(root, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+
+	fs := &fakeSink{}
+	proc := NewProcessor(Options{Sink: fs, FailedDir: sp.Dirs.Failed, Logger: quiet})
+	path := filepath.Join(sp.Dirs.Processing, "r.list")
+	var mu sync.Mutex
+	failures := 3
+	proc.remove = func(p string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p == path && failures > 0 {
+			failures--
+			return errors.New("file is held by another process")
+		}
+		return os.Remove(p)
+	}
+	// MaxFileAttempts 1: a single counted failure would quarantine the file.
+	r := &Runner{Spool: sp, Proc: proc, Workers: 1, MaxFileAttempts: 1, RetryBase: time.Millisecond, RetryMax: 2 * time.Millisecond, Logger: quiet}
+
+	if err := os.WriteFile(path, []byte("{\"i\":1}\n{\"i\":2}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sp.Disp.Add(path, 16)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for exists(path) || sp.Disp.BacklogFiles() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the file was never removed")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := fs.got(); len(got) != 2 {
+		t.Fatalf("retrying the removal must not redeliver: got %v", got)
+	}
+	if exists(filepath.Join(sp.Dirs.Failed, "r.list")) {
+		t.Fatal("a delivered file must never be quarantined")
+	}
+	if exists(path + spool.CheckpointExt) {
+		t.Fatal("checkpoint left behind")
+	}
+}
+
+func TestProcessor_UnremovableFileIsCleanupPending(t *testing.T) {
+	e := newEnv(t, nil)
+	p := e.writeFile(t, "u.list", "{\"i\":1}\n")
+	e.proc.remove = func(string) error { return errors.New("busy") }
+	err := e.proc.ProcessFile(context.Background(), p)
+	if !errors.Is(err, ErrCleanupPending) || !errors.Is(err, ErrRetryLater) {
+		t.Fatalf("want ErrCleanupPending (a kind of ErrRetryLater), got %v", err)
+	}
+	ck, v, _ := OpenCheckpoint(p + spool.CheckpointExt)
+	ck.Close()
+	if v != 1 {
+		t.Fatalf("the checkpoint must cover the whole file, got %d", v)
 	}
 }

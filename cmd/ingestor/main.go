@@ -200,7 +200,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		SignatureHeader:    cfg.WebhookSignatureHeader,
 		TimestampHeader:    cfg.WebhookTimestampHeader,
 		Tolerance:          cfg.WebhookTolerance,
-	}, w, sp.Disp, log)
+	}, w, sp, log)
 
 	var adm *admin.Admin
 	if adminLn != nil {
@@ -211,7 +211,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 				if !w.Healthy() {
 					return false, "write-ahead log is not accepting data"
 				}
-				if cfg.MaxBacklogBytes > 0 && sp.Disp.BacklogBytes() > cfg.MaxBacklogBytes {
+				if cfg.MaxBacklogBytes > 0 && sp.BacklogBytes() > cfg.MaxBacklogBytes {
 					return false, "processing backlog is full"
 				}
 				return true, ""
@@ -278,7 +278,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 
 	log.Info("stopped",
-		"files_left_for_next_start", sp.Disp.BacklogFiles(),
-		"bytes_left_for_next_start", sp.Disp.BacklogBytes())
+		"files_left_for_next_start", sp.BacklogFiles(),
+		"bytes_left_for_next_start", sp.BacklogBytes())
 	return runErr
 }

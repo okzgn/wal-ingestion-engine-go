@@ -26,6 +26,7 @@ type Runner struct {
 
 	mu       sync.Mutex
 	attempts map[string]int
+	cleanups map[string]int // rounds spent only retrying the removal of a file
 }
 
 // Run starts the workers and blocks until ctx is cancelled and every worker has
@@ -44,6 +45,7 @@ func (r *Runner) Run(ctx context.Context) {
 		r.Logger = slog.Default()
 	}
 	r.attempts = map[string]int{}
+	r.cleanups = map[string]int{}
 
 	var wg sync.WaitGroup
 	for i := 0; i < r.Workers; i++ {
@@ -70,6 +72,13 @@ func (r *Runner) worker(ctx context.Context) {
 		case ctx.Err() != nil || errors.Is(err, context.Canceled):
 			// Shutting down: the file stays in processing/ with its checkpoint.
 			return
+		case errors.Is(err, ErrCleanupPending):
+			// Everything was delivered; only the removal is left. It is retried
+			// without counting as a failed attempt: a delivered file must never
+			// end up quarantined in failed/.
+			delay := Backoff(r.bumpCleanup(path), r.RetryBase, r.RetryMax)
+			r.Logger.Warn("processed file not removed yet", "file", path, "retry_in", delay, "err", err)
+			r.Spool.Disp.Requeue(path, delay)
 		default:
 			n := r.bump(path)
 			if r.MaxFileAttempts > 0 && n >= r.MaxFileAttempts {
@@ -96,8 +105,16 @@ func (r *Runner) bump(path string) int {
 	return r.attempts[path]
 }
 
+func (r *Runner) bumpCleanup(path string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cleanups[path]++
+	return r.cleanups[path]
+}
+
 func (r *Runner) forget(path string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.attempts, path)
+	delete(r.cleanups, path)
 }
