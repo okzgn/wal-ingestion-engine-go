@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -20,6 +21,61 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// testSink is a backend with a fixed latency. It counts what the engine
+// delivers, so one run measures both sides: how fast messages are accepted and
+// how fast they come out the other end.
+type testSink struct {
+	delay time.Duration
+	mu    sync.Mutex
+	keys  map[string]int // X-Delivery-Id -> times delivered
+	total int
+}
+
+func startSink(addr string, delay time.Duration) *testSink {
+	s := &testSink{delay: delay, keys: map[string]int{}}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "test backend:", err)
+		os.Exit(1)
+	}
+	srv := &http.Server{
+		ReadHeaderTimeout: 10 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			time.Sleep(s.delay)
+			s.mu.Lock()
+			s.total++
+			s.keys[r.Header.Get("X-Delivery-Id")]++
+			s.mu.Unlock()
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	return s
+}
+
+func (s *testSink) counts() (total, distinct int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.total, len(s.keys)
+}
+
+// report waits until every acknowledged message has reached the backend (or
+// the wait runs out) and prints the drain rate since the first request.
+func (s *testSink) report(acked int, start time.Time, wait time.Duration) {
+	deadline := time.Now().Add(wait)
+	for {
+		if _, distinct := s.counts(); distinct >= acked || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	total, distinct := s.counts()
+	fmt.Println("backend: latency="+s.delay.String(), "delivered", distinct, "of", acked, "acknowledged in", elapsed.Round(time.Millisecond))
+	fmt.Printf("drain=%.0f msg/s duplicates=%d", float64(distinct)/elapsed.Seconds(), total-distinct)
+	fmt.Println()
+}
 
 // sign adds the signature headers of the given scheme, as the engine's
 // WEBHOOK_SIGNATURE_SCHEME expects them.
@@ -61,8 +117,17 @@ func main() {
 		header  = flag.String("header", "", "signature header name (default: the scheme's own)")
 		idsFile = flag.String("ids", "", "write the id of every request acknowledged with 200 to this file")
 		prefix  = flag.String("prefix", "m", "message id prefix")
+
+		sinkAddr  = flag.String("sink-addr", "", "also run a test backend on this address (point SINK_URL at it) and measure the drain rate")
+		sinkDelay = flag.Duration("sink-delay", 20*time.Millisecond, "latency of the test backend")
+		sinkWait  = flag.Duration("sink-wait", 2*time.Minute, "how long to wait for the test backend to receive everything")
 	)
 	flag.Parse()
+
+	var sink *testSink
+	if *sinkAddr != "" {
+		sink = startSink(*sinkAddr, *sinkDelay)
+	}
 
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -137,6 +202,10 @@ func main() {
 	fmt.Printf("throughput=%.0f req/s net_errors=%d\n", float64(len(latencies))/elapsed.Seconds(), netErrors.Load())
 	fmt.Printf("latency p50=%s p90=%s p99=%s max=%s\n", pct(0.50), pct(0.90), pct(0.99), pct(1))
 	fmt.Printf("status codes: %v\n", codes)
+
+	if sink != nil {
+		sink.report(codes[http.StatusOK], start, *sinkWait)
+	}
 
 	if *idsFile != "" {
 		if err := os.WriteFile(*idsFile, []byte(strings.Join(acked, "\n")+"\n"), 0o600); err != nil {

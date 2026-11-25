@@ -25,6 +25,14 @@ import (
 
 var binPath string
 
+// client keeps its connections alive. The default client keeps two per host:
+// under load every other request opens a new socket, and on Windows a few
+// thousand of them in TIME_WAIT exhaust the ephemeral ports.
+var client = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 30 * time.Second},
+}
+
 func TestMain(m *testing.M) {
 	flag.Parse()
 	if testing.Short() {
@@ -126,13 +134,22 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-func freeAddr(t *testing.T) string {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+// freeAddrs returns two distinct free addresses. Both listeners are held open
+// until both are known: asking for one port, releasing it and asking again can
+// return the same port twice.
+func freeAddrs(t *testing.T) (string, string) {
+	t.Helper()
+	a, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
-	return l.Addr().String()
+	defer a.Close()
+	b, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	return a.Addr().String(), b.Addr().String()
 }
 
 func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
@@ -140,7 +157,8 @@ func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
 	if testing.Short() {
 		t.Skip("e2e skipped with -short")
 	}
-	in := &instance{t: t, addr: freeAddr(t), admin: freeAddr(t), stderr: &syncBuffer{}, done: make(chan struct{})}
+	addr, admin := freeAddrs(t)
+	in := &instance{t: t, addr: addr, admin: admin, stderr: &syncBuffer{}, done: make(chan struct{})}
 	in.cmd = exec.Command(binPath)
 	in.cmd.Env = append(os.Environ(),
 		"LISTEN_ADDR="+in.addr,
@@ -171,11 +189,11 @@ func start(t *testing.T, dataDir, sinkURL string, extra ...string) *instance {
 			t.Fatalf("process exited during startup: %v\n%s", in.exit, in.stderr.String())
 		default:
 		}
-		if resp, err := http.Get("http://" + in.admin + "/readyz"); err == nil {
+		if resp, err := client.Get("http://" + in.admin + "/readyz"); err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				// readyz comes up before the HTTP listener on a busy machine: check both.
-				if r2, err := http.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader("{}")); err == nil {
+				if r2, err := client.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader("{}")); err == nil {
 					r2.Body.Close()
 					return in
 				}
@@ -195,7 +213,7 @@ func (in *instance) kill() {
 }
 
 func (in *instance) post(body string) (int, string) {
-	resp, err := http.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader(body))
+	resp, err := client.Post("http://"+in.addr+"/webhook", "application/json", strings.NewReader(body))
 	if err != nil {
 		return -1, err.Error()
 	}
@@ -370,8 +388,9 @@ func TestE2E_SecondInstanceIsRefused(t *testing.T) {
 	first := start(t, dir, ds.srv.URL)
 	_ = first
 
+	addr, admin := freeAddrs(t)
 	cmd := exec.Command(binPath)
-	cmd.Env = append(os.Environ(), "LISTEN_ADDR="+freeAddr(t), "ADMIN_ADDR="+freeAddr(t), "DATA_DIR="+dir)
+	cmd.Env = append(os.Environ(), "LISTEN_ADDR="+addr, "ADMIN_ADDR="+admin, "DATA_DIR="+dir)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatal("the second instance must refuse to start")

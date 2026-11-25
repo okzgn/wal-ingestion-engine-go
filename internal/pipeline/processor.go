@@ -337,7 +337,7 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 	// Deliveries run concurrently, up to Concurrency at a time, and report back
 	// here: this goroutine alone owns the checkpoint and the dead-letter file.
 	var (
-		results  = make(chan outcome, p.o.Concurrency) // never blocks a delivery
+		results  = make(chan outcome, p.o.Concurrency+1) // window + one probe: never blocks a delivery
 		inflight int
 		settled  = map[uint64]bool{} // lines beyond the prefix already dealt with; true = delivered
 		nextSave = done + p.interval
