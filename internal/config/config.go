@@ -18,6 +18,12 @@ import (
 	"time"
 )
 
+// MaxMessageSizeLimit is the ceiling of MAX_MESSAGE_SIZE. It equals the longest
+// line the file reader delivers (pipeline.DefaultMaxLineSize), so a message can
+// never be acknowledged and then turn out too long to be delivered, not even by
+// a later run started with a lower limit.
+const MaxMessageSizeLimit = 16 << 20
+
 // Config holds every tunable of the engine.
 type Config struct {
 	ListenAddr string
@@ -201,6 +207,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxMessageSize < 1024 {
 		bad("MAX_MESSAGE_SIZE must be at least 1KiB")
+	}
+	if c.MaxMessageSize > MaxMessageSizeLimit {
+		bad("MAX_MESSAGE_SIZE must not exceed 16MiB: a larger message would be acknowledged and then be too long to deliver")
 	}
 	if c.MaxFileSize < 1 {
 		bad("MAX_FILE_SIZE must be positive")

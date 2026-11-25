@@ -50,9 +50,11 @@ type Options struct {
 	FailedDir string
 
 	// MaxLineSize is the longest line that is still delivered; a longer one is
-	// dead-lettered with its first MaxLineSize bytes. It is deliberately not the
-	// server's MAX_MESSAGE_SIZE: a file written under a larger limit must still
-	// deliver its messages whole after the limit is lowered. Default 16 MiB.
+	// dead-lettered whole. It is deliberately not the server's MAX_MESSAGE_SIZE:
+	// a file written under a larger limit must still deliver its messages after
+	// the limit is lowered. MAX_MESSAGE_SIZE can never exceed it (the
+	// configuration enforces that), or accepted messages could not be delivered.
+	// Default 16 MiB.
 	MaxLineSize int
 
 	CheckpointInterval int
@@ -186,7 +188,17 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		var derr error
 		switch {
 		case tooLong:
-			derr = deadLetter(lineNo, fmt.Sprintf("line exceeds the maximum line size of %d bytes; its first %d bytes are kept", p.o.MaxLineSize, len(line)), line)
+			// Too big to hold in memory, so it cannot be delivered; it is copied
+			// whole from the data file instead of being cut to what was read.
+			reason := fmt.Sprintf("line of %d bytes exceeds the maximum line size of %d bytes", lr.size, p.o.MaxLineSize)
+			if !terminated {
+				reason += "; unterminated (torn write)"
+			}
+			if err := bad.writeFrom(lineNo, reason, path, lr.start, lr.size); err != nil {
+				derr = fmt.Errorf("%w: line %d: %v", errDeadLetters, lineNo, err)
+			} else {
+				metrics.DeadLettered.Add(1)
+			}
 		case !terminated:
 			derr = deadLetter(lineNo, "unterminated line (torn write)", line)
 		case !json.Valid(line):
@@ -314,24 +326,11 @@ type badWriter struct {
 }
 
 func (b *badWriter) write(lineNo uint64, reason string, payload []byte) error {
-	if b.err != nil {
-		return b.err
+	if err := b.open(); err != nil {
+		return err
 	}
-	if b.f == nil {
-		f, err := os.OpenFile(b.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			b.err = err
-			return err
-		}
-		b.f = f
-		if err := fsutil.SyncDir(b.dir); err != nil {
-			b.err = err
-			return err
-		}
-	}
-	reason = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(reason)
 	rec := make([]byte, 0, len(reason)+len(payload)+32)
-	rec = fmt.Appendf(rec, "%d\t%s\t", lineNo, reason)
+	rec = appendBadHeader(rec, lineNo, reason)
 	rec = append(rec, payload...)
 	rec = append(rec, '\n')
 	b.dirty = true
@@ -340,6 +339,57 @@ func (b *badWriter) write(lineNo uint64, reason string, payload []byte) error {
 		return err
 	}
 	return nil
+}
+
+// writeFrom dead-letters the n bytes at offset off of the file src. The payload
+// is streamed, so a record of any size is kept whole without being loaded.
+func (b *badWriter) writeFrom(lineNo uint64, reason, src string, off, n int64) error {
+	if err := b.open(); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err // nothing was written: the dead-letter file is still sound
+	}
+	defer func() { _ = in.Close() }()
+
+	b.dirty = true
+	if _, err = b.f.Write(appendBadHeader(nil, lineNo, reason)); err == nil {
+		if _, err = io.Copy(b.f, io.NewSectionReader(in, off, n)); err == nil {
+			_, err = b.f.Write([]byte{'\n'})
+		}
+	}
+	if err != nil {
+		b.err = err
+	}
+	return err
+}
+
+// open creates the dead-letter file on first use.
+func (b *badWriter) open() error {
+	if b.err != nil {
+		return b.err
+	}
+	if b.f != nil {
+		return nil
+	}
+	f, err := os.OpenFile(b.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		b.err = err
+		return err
+	}
+	b.f = f
+	if err := fsutil.SyncDir(b.dir); err != nil {
+		b.err = err
+		return err
+	}
+	return nil
+}
+
+var badReasonReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
+
+func appendBadHeader(dst []byte, lineNo uint64, reason string) []byte {
+	return fmt.Appendf(dst, "%d\t%s\t", lineNo, badReasonReplacer.Replace(reason))
 }
 
 // sync makes the dead letters durable; it must precede a checkpoint save so a

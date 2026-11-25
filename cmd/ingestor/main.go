@@ -164,6 +164,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		Proc: pipeline.NewProcessor(pipeline.Options{
 			Sink:               dst,
 			FailedDir:          sp.Dirs.Failed,
+			MaxLineSize:        config.MaxMessageSizeLimit,
 			CheckpointInterval: cfg.CheckpointInterval,
 			Retry:              pipeline.RetryPolicy{MaxAttempts: cfg.SinkMaxAttempts, BaseDelay: cfg.SinkBackoffBase, MaxDelay: cfg.SinkBackoffMax},
 			Logger:             log,

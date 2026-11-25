@@ -127,6 +127,8 @@ func TestLoad_Errors(t *testing.T) {
 		{"bad bool", nil, map[string]string{"ADMIN_PPROF": "maybe"}, "ADMIN_PPROF"},
 		{"zero workers", nil, map[string]string{"WORKERS": "0"}, "WORKERS must be at least 1"},
 		{"tiny message limit", nil, map[string]string{"MAX_MESSAGE_SIZE": "10"}, "MAX_MESSAGE_SIZE"},
+		// R9: above the reader's line limit a message was acknowledged and then truncated.
+		{"message limit above the reader's", nil, map[string]string{"MAX_MESSAGE_SIZE": "32MiB", "MAX_BATCH_BYTES": "32MiB"}, "MAX_MESSAGE_SIZE must not exceed 16MiB"},
 		{"write <= ack", nil, map[string]string{"WRITE_TIMEOUT": "5s", "ACK_TIMEOUT": "5s"}, "WRITE_TIMEOUT"},
 		{"inflight below message", nil, map[string]string{"MAX_INFLIGHT_BYTES": "1KiB"}, "MAX_INFLIGHT_BYTES"},
 		{"batch below message", nil, map[string]string{"MAX_BATCH_BYTES": "1KiB"}, "MAX_BATCH_BYTES"},

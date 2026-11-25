@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/config"
+	"github.com/okzgn/wal-ingestion-engine-go/internal/pipeline"
 )
 
 // lookup mimics os.LookupEnv over a map.
@@ -60,6 +61,20 @@ func TestHealthcheckExitCodes(t *testing.T) {
 	buf.Reset()
 	if code := run([]string{"healthcheck"}, lookup(map[string]string{"ADMIN_ADDR": ""}), &buf); code != 1 || !strings.Contains(buf.String(), "disabled") {
 		t.Fatalf("disabled admin: exit %d, output %q", code, buf.String())
+	}
+}
+
+// Regression R9: the HTTP limit and the file reader's limit are two constants
+// in two packages; if they drift apart, a message can be acknowledged and then
+// be too long to deliver.
+func TestMessageLimitNeverExceedsTheReaders(t *testing.T) {
+	if config.MaxMessageSizeLimit > pipeline.DefaultMaxLineSize {
+		t.Fatalf("MAX_MESSAGE_SIZE may reach %d but the reader delivers lines up to %d",
+			config.MaxMessageSizeLimit, pipeline.DefaultMaxLineSize)
+	}
+	c, err := config.Load(nil, lookup(map[string]string{"MAX_MESSAGE_SIZE": "16MiB", "MAX_BATCH_BYTES": "16MiB"}))
+	if err != nil || c.MaxMessageSize != config.MaxMessageSizeLimit {
+		t.Fatalf("the limit itself must be accepted: %v", err)
 	}
 }
 
