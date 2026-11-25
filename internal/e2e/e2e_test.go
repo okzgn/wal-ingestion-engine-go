@@ -354,10 +354,11 @@ func TestE2E_CrashRecovery(t *testing.T) {
 	if lost != 0 {
 		t.Fatalf("%d acknowledged messages were lost", lost)
 	}
-	// At-least-once: duplicates are allowed but bounded by the checkpoint interval
-	// of the files that were in flight at the crash (4 workers x 50 lines).
-	if dups > 4*50 {
-		t.Errorf("%d duplicates exceed the bound of 200", dups)
+	// At-least-once: duplicates are allowed but bounded, per file in flight at
+	// the crash, by the checkpoint interval plus the delivery window:
+	// 4 workers x (50 lines + 8 concurrent deliveries).
+	if bound := 4 * (50 + 8); dups > bound {
+		t.Errorf("%d duplicates exceed the bound of %d", dups, bound)
 	}
 	in3.kill()
 }

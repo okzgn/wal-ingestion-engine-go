@@ -17,7 +17,7 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.ListenAddr != ":8080" || c.DataDir != "./data" || c.MaxMessageSize != 1<<20 ||
-		c.Workers != 4 || c.AckTimeout != 5*time.Second || c.AdminAddr != "127.0.0.1:9090" {
+		c.Workers != 4 || c.SinkConcurrency != 8 || c.AckTimeout != 5*time.Second || c.AdminAddr != "127.0.0.1:9090" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if c.WebhookSecret != "" || c.SinkURL != "" || c.SinkAuthorization != "" || len(c.TrustedProxies) != 0 {
@@ -126,6 +126,8 @@ func TestLoad_Errors(t *testing.T) {
 		{"bad size", nil, map[string]string{"MAX_FILE_SIZE": "huge"}, "MAX_FILE_SIZE"},
 		{"bad bool", nil, map[string]string{"ADMIN_PPROF": "maybe"}, "ADMIN_PPROF"},
 		{"zero workers", nil, map[string]string{"WORKERS": "0"}, "WORKERS must be at least 1"},
+		{"zero sink concurrency", nil, map[string]string{"SINK_CONCURRENCY": "0"}, "SINK_CONCURRENCY"},
+		{"huge sink concurrency", nil, map[string]string{"SINK_CONCURRENCY": "65"}, "SINK_CONCURRENCY"},
 		{"tiny message limit", nil, map[string]string{"MAX_MESSAGE_SIZE": "10"}, "MAX_MESSAGE_SIZE"},
 		// R9: above the reader's line limit a message was acknowledged and then truncated.
 		{"message limit above the reader's", nil, map[string]string{"MAX_MESSAGE_SIZE": "32MiB", "MAX_BATCH_BYTES": "32MiB"}, "MAX_MESSAGE_SIZE must not exceed 16MiB"},

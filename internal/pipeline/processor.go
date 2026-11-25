@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/okzgn/wal-ingestion-engine-go/internal/fsutil"
@@ -64,6 +65,14 @@ type Options struct {
 	// Default 16 MiB.
 	MaxLineSize int
 
+	// Concurrency is how many messages of one file may be in delivery at the
+	// same time (default 1). Deliveries then finish out of order, but progress
+	// is still recorded as a contiguous prefix of the file, so nothing is ever
+	// skipped. Only lines within Concurrency of that prefix are started, which
+	// bounds what a crash can make redeliver to CheckpointInterval-1 plus
+	// Concurrency lines per file. With 1 the file is delivered strictly in order.
+	Concurrency int
+
 	CheckpointInterval int
 	Retry              RetryPolicy
 	Logger             *slog.Logger
@@ -74,6 +83,11 @@ type Options struct {
 type Processor struct {
 	o        Options
 	interval uint64
+	window   uint64    // Options.Concurrency
+	bufs     sync.Pool // *[]byte: copies of the lines that are in delivery
+
+	carryMu sync.Mutex
+	carry   map[string]map[uint64]struct{} // see carryOver
 
 	// remove deletes a finished file or its checkpoint; tests inject faults here.
 	remove func(path string) error
@@ -102,11 +116,78 @@ func NewProcessor(o Options) *Processor {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	return &Processor{
+	if o.Concurrency <= 0 {
+		o.Concurrency = 1
+	}
+	p := &Processor{
 		o:        o,
 		interval: uint64(o.CheckpointInterval), //nolint:gosec // #nosec G115 -- forced to be >= 1 just above
+		window:   uint64(o.Concurrency),        //nolint:gosec // #nosec G115 -- forced to be >= 1 just above
 		remove:   func(path string) error { return fsutil.RemoveWithRetry(path, 5) },
 	}
+	p.carry = map[string]map[uint64]struct{}{}
+	p.bufs.New = func() any { return new([]byte) }
+	return p
+}
+
+// maxPooledLine keeps rare large messages from bloating the buffer pool.
+const maxPooledLine = 256 << 10
+
+// copyLine returns a pooled copy of line: the reader reuses its buffer, and a
+// line in delivery must outlive the next read.
+func (p *Processor) copyLine(line []byte) *[]byte {
+	bp := p.bufs.Get().(*[]byte)
+	*bp = append((*bp)[:0], line...)
+	return bp
+}
+
+func (p *Processor) freeLine(bp *[]byte) {
+	if bp != nil && cap(*bp) <= maxPooledLine {
+		p.bufs.Put(bp)
+	}
+}
+
+// carryOver remembers the lines of a file that were delivered beyond its
+// checkpoint when an attempt stops early (a line before them kept failing).
+// The next attempt in this process skips them, so a transient failure in the
+// middle of the delivery window does not deliver its neighbours twice. The
+// memory is lost in a crash: that is the redelivery the window bounds.
+func (p *Processor) carryOver(path string, settled map[uint64]bool) {
+	var keep map[uint64]struct{}
+	for n, delivered := range settled {
+		if delivered {
+			if keep == nil {
+				keep = map[uint64]struct{}{}
+			}
+			keep[n] = struct{}{}
+		}
+	}
+	p.carryMu.Lock()
+	defer p.carryMu.Unlock()
+	if keep == nil {
+		delete(p.carry, path)
+		return
+	}
+	p.carry[path] = keep
+}
+
+func (p *Processor) takeCarry(path string) map[uint64]struct{} {
+	p.carryMu.Lock()
+	defer p.carryMu.Unlock()
+	keep := p.carry[path]
+	delete(p.carry, path)
+	return keep
+}
+
+// Forget drops what the processor remembers about a file that will not be
+// processed again (it was moved away).
+func (p *Processor) Forget(path string) { p.takeCarry(path) }
+
+// outcome is the result of delivering one line.
+type outcome struct {
+	lineNo uint64
+	err    error
+	line   *[]byte
 }
 
 // ProcessFile delivers every message of the file at path. It returns:
@@ -135,6 +216,9 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		_ = bad.close()
 	}
 
+	// handled is the contiguous prefix of the file that is fully dealt with:
+	// every line up to it was delivered or dead-lettered. saved is the part of
+	// it the checkpoint already records.
 	var handled, saved uint64 = 0, done
 	// save makes the dead letters durable, then records the progress. A line is
 	// never marked handled before its dead letter is on disk: a dead-letter
@@ -175,6 +259,76 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 		log.Info("resuming file", "from_line", done+1)
 	}
 
+	// Deliveries run concurrently, up to Concurrency at a time, and report back
+	// here: this goroutine alone owns the checkpoint and the dead-letter file.
+	var (
+		results  = make(chan outcome, p.o.Concurrency) // never blocks a delivery
+		inflight int
+		settled  = map[uint64]bool{} // lines beyond the prefix already dealt with; true = delivered
+		nextSave = done + p.interval
+
+		stalled  *outcome // the lowest line whose delivery kept failing
+		dlErr    error    // a dead letter could not be written or synced
+		canceled bool
+		readErr  error
+	)
+	// Lines a previous attempt at this file delivered beyond its checkpoint.
+	for n := range p.takeCarry(path) {
+		if n > done {
+			settled[n] = true
+		}
+	}
+	// advance moves the prefix over the settled lines and checkpoints when due.
+	advance := func() {
+		for {
+			if _, ok := settled[handled+1]; !ok {
+				break
+			}
+			delete(settled, handled+1)
+			handled++
+		}
+		if handled < nextSave || dlErr != nil {
+			return
+		}
+		nextSave = handled + p.interval
+		if err := save(); err != nil {
+			if errors.Is(err, errDeadLetters) {
+				dlErr = err
+				return
+			}
+			log.Warn("cannot save checkpoint; more lines would be redelivered after a crash", "err", err)
+		}
+	}
+	// settle takes in the outcome of one delivery.
+	settle := func(o outcome) {
+		inflight--
+		switch {
+		case o.err == nil:
+			metrics.Delivered.Add(1)
+			settled[o.lineNo] = true
+		case sink.IsPermanent(o.err):
+			log.Warn("message rejected for good by the sink", "line", o.lineNo, "err", o.err)
+			if err := deadLetter(o.lineNo, o.err.Error(), *o.line); err != nil {
+				dlErr = err
+			} else {
+				settled[o.lineNo] = false
+			}
+		case ctx.Err() != nil:
+			canceled = true
+		default:
+			// The failed line is NOT settled: the prefix, and with it the
+			// checkpoint, stops right before it and nothing after it is skipped
+			// or deleted. Later lines that did get through are remembered (see
+			// carryOver) so the next attempt does not deliver them twice.
+			if stalled == nil || o.lineNo < stalled.lineNo {
+				stalled = &outcome{lineNo: o.lineNo, err: o.err}
+			}
+		}
+		p.freeLine(o.line)
+		advance()
+	}
+	stopping := func() bool { return stalled != nil || dlErr != nil || canceled }
+
 	lr := newLineReader(f, p.o.MaxLineSize)
 	var lineNo uint64
 	for {
@@ -183,21 +337,42 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 			break
 		}
 		if rerr != nil {
-			checkpoint()
-			return postpone(fmt.Errorf("read: %w", rerr))
+			readErr = rerr
+			break
 		}
 		lineNo++
 		if lineNo <= done {
 			handled = lineNo
 			continue
 		}
-		if err := ctx.Err(); err != nil {
-			checkpoint()
-			release()
-			return err
+		if lineNo <= handled || settled[lineNo] {
+			advance()
+			continue // delivered by a previous attempt
 		}
 
-		var derr error
+		// Take in whatever has finished, then hold this line until it is within
+		// Concurrency of the prefix. That window is what bounds the redelivery
+		// after a crash, and with Concurrency 1 it makes the file strictly
+		// sequential: a line starts only once the previous one is dealt with.
+		for more := true; more; {
+			select {
+			case o := <-results:
+				settle(o)
+			default:
+				more = false
+			}
+		}
+		for lineNo > handled+p.window && inflight > 0 {
+			settle(<-results)
+		}
+		if stopping() {
+			break
+		}
+		if ctx.Err() != nil {
+			canceled = true
+			break
+		}
+
 		switch {
 		case tooLong:
 			// Too big to hold in memory, so it cannot be delivered; it is copied
@@ -207,52 +382,56 @@ func (p *Processor) ProcessFile(ctx context.Context, path string) error {
 				reason += "; unterminated (torn write)"
 			}
 			if err := bad.writeFrom(lineNo, reason, path, lr.start, lr.size); err != nil {
-				derr = fmt.Errorf("%w: line %d: %v", errDeadLetters, lineNo, err)
+				dlErr = fmt.Errorf("%w: line %d: %v", errDeadLetters, lineNo, err)
 			} else {
 				metrics.DeadLettered.Add(1)
 			}
 		case !terminated:
-			derr = deadLetter(lineNo, "unterminated line (torn write)", line)
+			dlErr = deadLetter(lineNo, "unterminated line (torn write)", line)
 		case !json.Valid(line):
-			derr = deadLetter(lineNo, "invalid JSON", line)
+			dlErr = deadLetter(lineNo, "invalid JSON", line)
 		default:
+			lp := p.copyLine(line)
 			key := fmt.Sprintf("%s:%d", name, lineNo)
-			derr = p.deliver(ctx, key, line)
-			switch {
-			case derr == nil:
-				metrics.Delivered.Add(1)
-			case sink.IsPermanent(derr):
-				log.Warn("message rejected for good by the sink", "line", lineNo, "err", derr)
-				derr = deadLetter(lineNo, derr.Error(), line)
-			case ctx.Err() != nil:
-				checkpoint()
-				release()
-				return ctx.Err()
-			default:
-				// The failed line is NOT marked as handled: the checkpoint stays
-				// right before it and nothing after it is skipped or deleted.
-				log.Warn("sink keeps failing; postponing file", "line", lineNo, "err", derr)
-				checkpoint()
-				return postpone(fmt.Errorf("line %d: %w", lineNo, derr))
-			}
+			inflight++
+			go func(n uint64) {
+				results <- outcome{lineNo: n, err: p.deliver(ctx, key, *lp), line: lp}
+			}(lineNo)
+			continue
 		}
-		if derr != nil {
-			// The dead letter is not on disk, so the line is not handled: the
-			// checkpoint stays before it and the file is tried again later.
-			log.Error("cannot write dead letter; postponing file", "line", lineNo, "err", derr)
-			return postpone(derr)
+		if dlErr != nil {
+			break
 		}
+		settled[lineNo] = false
+		advance()
+		if dlErr != nil {
+			break
+		}
+	}
+	for inflight > 0 {
+		settle(<-results)
+	}
+	if stopping() || readErr != nil {
+		p.carryOver(path, settled)
+	}
 
-		handled = lineNo
-		if handled%p.interval == 0 {
-			if err := save(); err != nil {
-				if errors.Is(err, errDeadLetters) {
-					log.Error("cannot make dead letters durable; postponing file", "err", err)
-					return postpone(err)
-				}
-				log.Warn("cannot save checkpoint; more lines would be redelivered after a crash", "err", err)
-			}
-		}
+	switch {
+	case dlErr != nil:
+		// The dead letter is not on disk, so its line is not handled: the
+		// checkpoint stays before it and the file is tried again later.
+		log.Error("cannot make dead letters durable; postponing file", "err", dlErr)
+		return postpone(dlErr)
+	case canceled:
+		checkpoint()
+		release()
+		return ctx.Err()
+	case stalled != nil:
+		log.Warn("sink keeps failing; postponing file", "line", stalled.lineNo, "err", stalled.err)
+		checkpoint()
+		return postpone(fmt.Errorf("line %d: %w", stalled.lineNo, stalled.err))
+	case readErr != nil:
+		checkpoint()
+		return postpone(fmt.Errorf("read: %w", readErr))
 	}
 
 	// The file is deleted only once every dead letter is durable. The final

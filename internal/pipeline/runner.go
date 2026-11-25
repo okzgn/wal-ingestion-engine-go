@@ -89,6 +89,7 @@ func (r *Runner) worker(ctx context.Context) {
 					continue
 				}
 				r.forget(path)
+				r.Proc.Forget(path)
 				continue
 			}
 			delay := Backoff(n, r.RetryBase, r.RetryMax)

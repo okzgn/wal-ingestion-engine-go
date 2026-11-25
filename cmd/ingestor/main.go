@@ -151,7 +151,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 		dst = sink.NewHTTP(sink.HTTPConfig{
 			URL:               cfg.SinkURL,
 			Timeout:           cfg.SinkTimeout,
-			MaxConns:          cfg.Workers,
+			MaxConns:          cfg.Workers * cfg.SinkConcurrency, // one warm connection per delivery in flight
 			Authorization:     cfg.SinkAuthorization,
 			Headers:           cfg.SinkHeaders,
 			PermanentStatuses: cfg.SinkPermanentStatuses,
@@ -165,6 +165,7 @@ func serve(parent context.Context, cfg *config.Config, log *slog.Logger) error {
 			Sink:               dst,
 			FailedDir:          sp.Dirs.Failed,
 			MaxLineSize:        config.MaxMessageSizeLimit,
+			Concurrency:        cfg.SinkConcurrency,
 			CheckpointInterval: cfg.CheckpointInterval,
 			Retry:              pipeline.RetryPolicy{MaxAttempts: cfg.SinkMaxAttempts, BaseDelay: cfg.SinkBackoffBase, MaxDelay: cfg.SinkBackoffMax},
 			Logger:             log,

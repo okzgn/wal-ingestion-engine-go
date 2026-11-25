@@ -24,6 +24,11 @@ import (
 // a later run started with a lower limit.
 const MaxMessageSizeLimit = 16 << 20
 
+// MaxSinkConcurrency caps SINK_CONCURRENCY. Every message in delivery is held
+// in memory, and WORKERS x SINK_CONCURRENCY requests hit the destination at
+// once: past this point a faster destination helps, more concurrency does not.
+const MaxSinkConcurrency = 64
+
 // Config holds every tunable of the engine.
 type Config struct {
 	ListenAddr string
@@ -41,6 +46,7 @@ type Config struct {
 	MaxBacklogBytes  int64
 
 	Workers               int
+	SinkConcurrency       int
 	CheckpointInterval    int
 	SinkURL               string
 	SinkTimeout           time.Duration
@@ -96,7 +102,8 @@ func settings(c *Config) []setting {
 		{"MAX_INFLIGHT_BYTES", "max-inflight-bytes", "64MiB", "503 above this many bytes waiting for the disk", size(&c.MaxInflightBytes)},
 		{"MAX_BACKLOG_BYTES", "max-backlog-bytes", "1GiB", "503 above this much unprocessed data on disk", size(&c.MaxBacklogBytes)},
 
-		{"WORKERS", "workers", "4", "concurrent file workers (1 = in-order delivery)", num(&c.Workers)},
+		{"WORKERS", "workers", "4", "files processed at the same time", num(&c.Workers)},
+		{"SINK_CONCURRENCY", "sink-concurrency", "8", "messages of one file in delivery at the same time (WORKERS=1 with 1 here = in-order delivery)", num(&c.SinkConcurrency)},
 		{"CHECKPOINT_INTERVAL", "checkpoint-interval", "50", "lines between checkpoint saves", num(&c.CheckpointInterval)},
 		{"SINK_URL", "sink-url", "", "forward every message to this URL (empty = discard)", str(&c.SinkURL)},
 		{"SINK_TIMEOUT", "sink-timeout", "10s", "timeout of one delivery request", dur(&c.SinkTimeout)},
@@ -237,6 +244,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Workers < 1 {
 		bad("WORKERS must be at least 1")
+	}
+	if c.SinkConcurrency < 1 || c.SinkConcurrency > MaxSinkConcurrency {
+		bad("SINK_CONCURRENCY must be between 1 and %d", MaxSinkConcurrency)
 	}
 	if c.CheckpointInterval < 1 {
 		bad("CHECKPOINT_INTERVAL must be at least 1")
