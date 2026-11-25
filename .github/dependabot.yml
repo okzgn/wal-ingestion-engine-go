@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # Go modules (and, through go.mod, the minimum toolchain).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+
+  # The pinned commits of the CI actions.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # The base images of the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

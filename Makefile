@@ -31,8 +31,12 @@ lint:
 	golangci-lint run
 
 # Known vulnerabilities in the toolchain and the dependencies actually called.
+# The version is pinned (keep it in sync with .github/workflows/ci.yml) so the
+# same commit gives the same answer locally and in CI.
+GOVULNCHECK_VERSION := v1.10.0
+
 vuln:
-	govulncheck ./...
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 # Everything CI runs.
 check: fmt-check vet lint vuln test
